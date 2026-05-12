@@ -1,11 +1,10 @@
 # Embers · v0.1 dependencies
 # Python 3.11+
 
-# Core
+# Embedding & LLM(全部通过 OpenAI SDK 兼容协议接入,无需厂商专属包)
 openai>=1.40.0
-anthropic>=0.40.0
 
-# Vector storage(选其一,我们用 sqlite-vec)
+# Vector storage(sqlite-vec 单文件,零运维)
 sqlite-vec>=0.1.3
 
 # API & validation

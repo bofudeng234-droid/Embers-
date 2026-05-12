@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DB_PATH = Path(os.getenv("EMBERS_DB_PATH", "./data/embers.db"))
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1536"))
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "2048"))  # 默认匹配智谱 embedding-3
 
 
 def connect() -> sqlite3.Connection:

@@ -15,8 +15,9 @@ Embers · FastAPI 服务层
 from __future__ import annotations
 
 import os
+import time
+import json
 from pathlib import Path
-from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from openai import OpenAI
 
 from pipeline import store, embed
 
@@ -35,7 +37,6 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Demo 阶段:允许任意来源访问。生产收紧到主页域名。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -44,11 +45,64 @@ app.add_middleware(
 )
 
 
+# ============ LLM provider 配置(rerank 用) ============
+LLM_PROVIDERS = {
+    "deepseek": {
+        "base_url": "https://api.deepseek.com/v1",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "default_model": "deepseek-chat",
+    },
+    "kimi": {
+        "base_url": "https://api.moonshot.cn/v1",
+        "api_key_env": "MOONSHOT_API_KEY",
+        "default_model": "moonshot-v1-8k",
+    },
+    "zhipu": {
+        "base_url": "https://open.bigmodel.cn/api/paas/v4/",
+        "api_key_env": "ZHIPU_API_KEY",
+        "default_model": "glm-4-flash",
+    },
+    "openai": {
+        "base_url": "https://api.openai.com/v1",
+        "api_key_env": "OPENAI_API_KEY",
+        "default_model": "gpt-4o-mini",
+    },
+}
+
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "deepseek").lower()
+LLM_MODEL = os.getenv("LLM_MODEL")  # 不设则用 provider 默认
+
+_llm_client: OpenAI | None = None
+
+
+def llm_client() -> OpenAI:
+    global _llm_client
+    if _llm_client is None:
+        if LLM_PROVIDER not in LLM_PROVIDERS:
+            raise RuntimeError(f"LLM_PROVIDER={LLM_PROVIDER} 不支持")
+        cfg = LLM_PROVIDERS[LLM_PROVIDER]
+        api_key = os.getenv(cfg["api_key_env"])
+        if not api_key:
+            raise RuntimeError(
+                f"未找到 {cfg['api_key_env']}。请在 .env 里配置(provider={LLM_PROVIDER})"
+            )
+        _llm_client = OpenAI(api_key=api_key, base_url=cfg["base_url"])
+    return _llm_client
+
+
+def llm_model_name() -> str:
+    if LLM_MODEL:
+        return LLM_MODEL
+    return LLM_PROVIDERS[LLM_PROVIDER]["default_model"]
+
+
 # ============ Models ============
 class HealthResponse(BaseModel):
     status: str
     video_count: int
     embedding_dim: int
+    embedding_provider: str
+    llm_provider: str
 
 
 class VideoRow(BaseModel):
@@ -80,7 +134,6 @@ class SearchResponse(BaseModel):
 
 # ============ Helpers ============
 def get_conn():
-    """每次请求新连接,避免 SQLite 多线程坑。"""
     conn = store.connect()
     store.init_schema(conn)
     return conn
@@ -95,6 +148,8 @@ def health():
             status="ok",
             video_count=store.count(conn),
             embedding_dim=store.EMBEDDING_DIM,
+            embedding_provider=embed.PROVIDER,
+            llm_provider=LLM_PROVIDER,
         )
     finally:
         conn.close()
@@ -102,7 +157,6 @@ def health():
 
 @app.get("/videos", response_model=list[VideoRow])
 def list_videos(limit: int = 200, offset: int = 0):
-    """列出所有视频,用于前端的"余烬墙"渲染。"""
     conn = get_conn()
     try:
         rows = conn.execute(
@@ -127,33 +181,25 @@ def list_videos(limit: int = 200, offset: int = 0):
 
 @app.post("/search", response_model=SearchResponse)
 def search(req: SearchRequest):
-    """模糊查询入口 · 文本 → embedding → 向量库 top-K → (可选)LLM rerank。"""
-    import time
     t0 = time.time()
-
-    # 1. query 改写(可选,目前直接用原文)
     q_text = req.query.strip()
 
-    # 2. embed query
     try:
         q_vec = embed.embed(q_text)
     except Exception as e:
         raise HTTPException(500, f"embedding 失败: {e}")
 
-    # 3. 向量检索
     conn = get_conn()
     try:
         raw_hits = store.search(conn, q_vec, top_k=req.top_k)
     finally:
         conn.close()
 
-    # 4. (可选)LLM 解释
     explanations: dict[str, str] = {}
     if req.rerank and raw_hits:
         try:
             explanations = _llm_explain(q_text, raw_hits)
         except Exception:
-            # 解释失败不阻断主搜索结果
             explanations = {}
 
     hits = [
@@ -167,22 +213,16 @@ def search(req: SearchRequest):
     ]
 
     return SearchResponse(
-        query=q_text,
-        hits=hits,
+        query=q_text, hits=hits,
         latency_ms=int((time.time() - t0) * 1000),
     )
 
 
 def _llm_explain(query: str, hits: list[dict]) -> dict[str, str]:
-    """用 Claude 对 top hits 生成"我猜是这条因为..."的解释。
-    返回 {video_id: explanation}。
-    """
-    from anthropic import Anthropic
-    client = Anthropic()
-
+    """用配置的 LLM(默认 DeepSeek)给 top hits 生成"我猜是这条因为..."的解释。"""
     top = hits[:3]
     candidates_text = "\n".join(
-        f"[{h['id']}] 标题: {h['title']} | 笔记: {h['notes']} | caption: {h['caption']}"
+        f"[{h['id']}] 标题: {h.get('title') or '(无)'} | 笔记: {h.get('notes') or '(无)'} | caption: {h.get('caption') or '(无)'}"
         for h in top
     )
 
@@ -193,20 +233,24 @@ def _llm_explain(query: str, hits: list[dict]) -> dict[str, str]:
 {candidates_text}
 
 对每条视频,用一句话(≤25 字)解释"为什么这条可能是用户在找的"。
-输出严格 JSON 格式: {{"视频id": "解释"}}, 不要其他文字。
+只输出 JSON,key 是视频 id,value 是解释字符串。不要任何 markdown 或多余文字。
+示例: {{"v001": "提到了猫骑在扫地机器人上还叫了一声"}}
 """
 
-    resp = client.messages.create(
-        model=os.getenv("RERANK_MODEL", "claude-sonnet-4-6"),
-        max_tokens=400,
+    resp = llm_client().chat.completions.create(
+        model=llm_model_name(),
         messages=[{"role": "user", "content": prompt}],
+        max_tokens=400,
+        temperature=0.3,
     )
 
-    import json
-    text = resp.content[0].text.strip()
-    # 容错:Claude 偶尔会包 ```json
+    text = resp.choices[0].message.content.strip()
+    # 容错:LLM 偶尔会包 ```json
     if text.startswith("```"):
-        text = text.split("```")[1].lstrip("json").strip()
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
     try:
         return json.loads(text)
     except Exception:

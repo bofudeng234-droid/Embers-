@@ -13,18 +13,21 @@
 
 **这相当于把抖音的观看历史从"原始视频列表"变成"语义记忆库",存储成本下降 ~170×,搜索精度从"关键词命中"变成"语义命中"。**
 
-## 技术栈(48h 单兵交付)
+## 技术栈(48h 单兵交付 · 全国产 AI 栈)
 
 | 层 | 工具 | 理由 |
 |---|---|---|
-| 视频转写 | OpenAI Whisper(或抖音 caption API) | 成熟、准、便宜 |
-| 文本 embedding | OpenAI text-embedding-3-small(1536d) | 速度快、质量稳、~$0.02/1M tokens |
-| 视觉 embedding(v0.2) | CLIP ViT-L/14 | 多模态联合检索 |
+| 视频转写 | (v0.2)OpenAI Whisper 本地 | 暂不用,v0.1 只对文本做 embedding |
+| **文本 embedding** | **智谱 GLM `embedding-3`(2048d)** | 中文强、便宜、OpenAI 兼容协议 |
+| 视觉 embedding(v0.2) | CLIP ViT-L/14 / BGE-VL | 多模态联合检索 |
 | 向量存储 | sqlite-vec(单文件 SQLite) | 零运维、本地化、隐私故事强 |
-| LLM rerank | Claude Sonnet 4.6 | 模糊 query 改写 + 结果解释 |
+| **LLM rerank** | **DeepSeek-V4 `deepseek-chat`** | 中文强、价格 Claude 1/15、OpenAI 兼容 |
 | API | FastAPI | Python 单文件起步 |
-| 前端 | 纯 HTML + Alpine.js + Framer Motion CDN | 不引重型框架,polish 速度 > 一切 |
-| 部署(赛后) | Cloudflare Pages + Workers(已有账号) | 跟 fourth-fire.com 同栈 |
+| 前端 | 纯 HTML + 内联 CSS + vanilla JS | 不引重型框架,polish 速度 > 一切 |
+| 部署(赛后) | Cloudflare Pages + Workers | 跟 fourth-fire.com 同栈 |
+
+> 所有 provider 通过 OpenAI 兼容协议接入,换 provider 只改 `.env`,代码不动。
+> 可切换的 provider 见 `.env.example`。
 
 ## 关键架构(QKV 类比)
 
