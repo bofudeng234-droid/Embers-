@@ -1,12 +1,13 @@
 """
-Embedding 生成层 · 多 provider 切换 · 统一通过 OpenAI 兼容协议接入
+Embedding 生成层 · 多 provider 切换
 
-支持的 provider(在 .env 用 EMBEDDING_PROVIDER 切换):
-  zhipu   智谱 GLM embedding-3(默认,中文场景推荐)
-  openai  OpenAI text-embedding-3-small
+v0.2 关键变化:
+  embedding 输入文本 = caption(yt-dlp metadata)+ transcript(Whisper)+ frame_desc ×N(VLM)
+  全部客观信号,不依赖用户 notes。
 """
 from __future__ import annotations
 
+import json
 import os
 from typing import Iterable
 
@@ -15,7 +16,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ============ Provider 配置 ============
 PROVIDERS = {
     "zhipu": {
         "base_url": "https://open.bigmodel.cn/api/paas/v4/",
@@ -33,9 +33,7 @@ PROVIDERS = {
 
 PROVIDER = os.getenv("EMBEDDING_PROVIDER", "zhipu").lower()
 if PROVIDER not in PROVIDERS:
-    raise ValueError(
-        f"EMBEDDING_PROVIDER={PROVIDER!r} 不支持。可选: {list(PROVIDERS)}"
-    )
+    raise ValueError(f"EMBEDDING_PROVIDER={PROVIDER!r} 不支持。可选: {list(PROVIDERS)}")
 
 _cfg = PROVIDERS[PROVIDER]
 MODEL = os.getenv("EMBEDDING_MODEL", _cfg["default_model"])
@@ -45,32 +43,48 @@ _client: OpenAI | None = None
 
 
 def client() -> OpenAI:
-    """惰性初始化 OpenAI 兼容客户端。"""
     global _client
     if _client is None:
         api_key = os.getenv(_cfg["api_key_env"])
         if not api_key:
             raise RuntimeError(
-                f"未找到 {_cfg['api_key_env']}。请在 .env 里配置 "
-                f"{_cfg['api_key_env']}=...(provider={PROVIDER})"
+                f"未找到 {_cfg['api_key_env']}(EMBEDDING_PROVIDER={PROVIDER})"
             )
         _client = OpenAI(api_key=api_key, base_url=_cfg["base_url"])
     return _client
 
 
 def build_embedding_text(row: dict) -> str:
-    """把视频的多个字段拼成一段语义文本,作为 embedding 的输入。
-    顺序经过权重设计:notes(用户记忆描述)最重,caption 次之,hashtags 最弱。
+    """把多路客观信号拼成 embedding 输入。
+    顺序经过权重设计:transcript(口播内容)和 frame_desc(视觉内容)权重最高,
+    caption 中等,title/hashtags 弱。
     """
     parts: list[str] = []
-    if row.get("notes"):
-        parts.append(f"记忆: {row['notes']}")
+
     if row.get("title"):
         parts.append(f"标题: {row['title']}")
-    if row.get("caption"):
-        parts.append(f"内容: {row['caption']}")
-    if row.get("hashtags"):
-        parts.append(f"标签: {row['hashtags']}")
+
+    if row.get("caption") and row["caption"] != row.get("title"):
+        cap = row["caption"][:400]  # 截断超长 caption
+        parts.append(f"描述: {cap}")
+
+    if row.get("transcript"):
+        tr = row["transcript"][:800]  # 转写文本截断,避免单条太长
+        parts.append(f"音频: {tr}")
+
+    # frame_desc 是 JSON 字符串(从 DB 读)或 list[str](入库前)
+    fd = row.get("frame_desc")
+    if fd:
+        if isinstance(fd, str):
+            try:
+                fd = json.loads(fd)
+            except Exception:
+                fd = [fd]
+        if isinstance(fd, list) and fd:
+            for i, d in enumerate(fd, 1):
+                if d:
+                    parts.append(f"画面{i}: {d}")
+
     return "\n".join(parts) if parts else (row.get("url") or "")
 
 
@@ -81,9 +95,6 @@ def embed(text: str) -> list[float]:
 
 
 def embed_batch(texts: list[str], batch_size: int = 64) -> list[list[float]]:
-    """批量 embed。单次请求多 input,降低 round-trip 开销。
-    智谱 embedding-3 单次最多 64 条,OpenAI 最多 2048 条,我们用 64 兼容两边。
-    """
     results: list[list[float]] = []
     for i in range(0, len(texts), batch_size):
         chunk = texts[i:i + batch_size]
@@ -99,15 +110,20 @@ if __name__ == "__main__":
 
     sample = {
         "title": "猫在 Roomba 上",
-        "caption": "猫咪骑在扫地机器人上来回滑行",
-        "hashtags": "#搞笑 #猫",
-        "notes": "记得它叫了一声很搞笑",
+        "caption": "搞笑萌宠日常,小猫第一次坐上扫地机器人",
+        "transcript": "你看这只猫,它居然敢站在扫地机器人上面来回滑。哈哈哈太搞笑了。",
+        "frame_desc": [
+            "一只橘猫静止站在白色扫地机器人上",
+            "扫地机器人启动,猫姿势紧张",
+            "猫开始张嘴叫喊",
+            "扫地机器人撞到家具,猫被甩出"
+        ],
     }
     text = build_embedding_text(sample)
-    print(f"\nEmbedding input:\n{text}")
+    print(f"\nEmbedding input:\n{text}\n")
 
     v = embed(text)
-    print(f"\n✅ Vector length: {len(v)}")
+    print(f"✅ Vector length: {len(v)}")
     print(f"   Sample first 5: {v[:5]}")
-    assert len(v) == NATIVE_DIM, f"模型返回维度 {len(v)} 不等于声明的 {NATIVE_DIM}"
+    assert len(v) == NATIVE_DIM, f"维度 {len(v)} != {NATIVE_DIM}"
     print(f"   维度匹配 OK")

@@ -299,21 +299,42 @@ async function doSearch(query) {
       return;
     }
 
-    // Add glow to top hits on the wall
-    j.hits.slice(0, 3).forEach((h, i) => {
+    // 点亮策略 · 兼顾"宽松找回"和"避免误亮"
+    //   Top1:只要不是完全无关(< 1.5),一定亮——这是 demo 魔法瞬间
+    //   Top2/3:必须跟 Top1 接近(gap < 0.25)且本身不烂(< 1.3)才一起亮
+    //   L2 距离参考:< 0.8 强相关 / < 1.1 相关 / < 1.3 弱相关 / > 1.4 基本无关
+    const TOP1_MAX = 1.15;     // Top1 绝对上限(必须是"决定性"匹配)
+    const SECOND_MAX = 1.00;   // Top2/3 自身必须达到的强相关水平
+    const SECOND_GAP = 0.08;   // Top2/3 跟 Top1 的最大距离差(防止小数据集全亮)
+
+    const lit = [];
+    if (j.hits.length > 0 && j.hits[0].distance < TOP1_MAX) {
+      lit.push(j.hits[0]);
+      for (let i = 1; i < Math.min(3, j.hits.length); i++) {
+        const h = j.hits[i];
+        if (h.distance < SECOND_MAX && h.distance - j.hits[0].distance < SECOND_GAP) {
+          lit.push(h);
+        }
+      }
+    }
+
+    lit.forEach((h, i) => {
       setTimeout(() => {
         const el = document.querySelector(`.video[data-id="${h.id}"]`);
         if (el) {
           el.classList.add('glow');
-          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          if (i === 0) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
         }
       }, i * 150);
     });
 
+    window._embers_lit = lit.length;
+
+    const litCount = window._embers_lit ?? 0;
     results.className = 'results has-results';
     results.innerHTML = `
       <div class="results-head">
-        <h2>${j.hits.length} 颗余烬被点亮 · "${escape(j.query)}"</h2>
+        <h2>${litCount} 颗余烬被点亮 · ${j.hits.length} 条候选 · "${escape(j.query)}"</h2>
         <span class="meta">${j.latency_ms} ms</span>
       </div>
       ${j.hits.map((h, i) => `

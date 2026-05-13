@@ -6,6 +6,10 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
+
+# 把项目根目录加进 sys.path,以便 `python scripts/search_demo.py` 直接跑能找到 pipeline 包
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pipeline import store, embed
 
@@ -24,9 +28,22 @@ def main(query: str, top_k: int = 5) -> None:
 
     print(f"\nTop {len(results)} 命中:\n")
     for i, r in enumerate(results, 1):
-        print(f"  [{i}] {r['title']} · distance={r['distance']:.4f}")
+        print(f"  [{i}] {r.get('title') or '(无标题)'} · distance={r['distance']:.4f}")
         print(f"      URL: {r['url']}")
-        print(f"      Notes: {r['notes']}")
+        if r.get('caption'):
+            cap = r['caption'][:80]
+            print(f"      Caption: {cap}{'...' if len(r['caption']) > 80 else ''}")
+        if r.get('transcript'):
+            tr = r['transcript'][:80]
+            print(f"      Transcript: {tr}{'...' if len(r['transcript']) > 80 else ''}")
+        if r.get('frame_desc'):
+            import json as _json
+            try:
+                fd = _json.loads(r['frame_desc'])
+                for j, d in enumerate(fd, 1):
+                    print(f"      Frame {j}: {d}")
+            except Exception:
+                pass
         print()
 
 

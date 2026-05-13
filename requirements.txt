@@ -1,13 +1,14 @@
-# Embers · v0.1 dependencies
+# Embers · v0.2 dependencies
 # Python 3.11+
+# 系统依赖: ffmpeg(brew install ffmpeg)
 
-# Embedding & LLM(全部通过 OpenAI SDK 兼容协议接入,无需厂商专属包)
+# Embedding & LLM(全部通过 OpenAI SDK 兼容协议接入)
 openai>=1.40.0
 
-# Vector storage(sqlite-vec 单文件,零运维)
+# Vector storage
 sqlite-vec>=0.1.3
 
-# API & validation
+# API
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 pydantic>=2.6.0
@@ -17,7 +18,13 @@ python-dotenv>=1.0.0
 pandas>=2.2.0
 tqdm>=4.66.0
 
-# Optional · v0.2(视觉 embedding,赛后再开)
-# torch>=2.2.0
-# transformers>=4.40.0
-# pillow>=10.0.0
+# === v0.2 多模态管线 ===
+# 视频下载(Playwright 真浏览器路径,绕过抖音反爬)
+playwright>=1.45.0
+yt-dlp>=2024.10.0     # 保留作为 fallback,主路径用 Playwright
+
+# 本地 Whisper(M 系列 Mac 友好,CT2 量化,首次下载 ~150MB 小模型)
+faster-whisper>=1.0.0
+
+# 图像处理(VLM 前置编码)
+pillow>=10.0.0
