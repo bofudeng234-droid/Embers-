@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import os
 import re
 import time
 from pathlib import Path
@@ -21,7 +22,6 @@ from typing import Any
 
 from playwright.sync_api import (
     sync_playwright,
-    Browser,
     BrowserContext,
     Page,
     Playwright,
@@ -29,11 +29,16 @@ from playwright.sync_api import (
 )
 
 
-MOBILE_UA = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-    "Version/16.0 Mobile/15E148 Safari/604.1"
+# 抖音 PC web 反而比 mobile web 更开放(mobile 总弹"打开 App 观看")
+PC_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
 )
+
+HEADLESS = os.getenv("PW_HEADLESS", "1").lower() not in ("0", "false", "no")
+DEBUG_DUMP = os.getenv("PW_DEBUG", "0").lower() in ("1", "true", "yes")
+DEBUG_DUMP_DIR = Path("./data/_debug")
 
 
 # ============ URL 规范化 ============
@@ -54,56 +59,74 @@ def normalize_douyin_url(raw: str) -> str | None:
     return url
 
 
-# ============ 浏览器单例(进程内复用) ============
+# ============ 浏览器单例(持久化 profile) ============
 _pw: Playwright | None = None
-_browser: Browser | None = None
 _context: BrowserContext | None = None
+
+# 持久化用户数据目录(cookies / localStorage / 登录态 都存这里)
+# 第一次扫码登录抖音后,后续所有运行都直接复用,无需再登
+PROFILE_DIR = Path(os.getenv(
+    "PW_PROFILE_DIR",
+    str(Path.home() / ".embers_pw_profile")
+))
 
 
 def _ensure_browser() -> BrowserContext:
-    """惰性初始化 Playwright + Chromium + Context。复用 = 速度。"""
-    global _pw, _browser, _context
+    """惰性初始化 Chromium · 持久化 profile · 自动反检测。"""
+    global _pw, _context
     if _context is None:
-        print("  [pw] 启动 Chromium...")
+        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"  [pw] 启动 Chromium · headless={HEADLESS} · profile={PROFILE_DIR}")
         _pw = sync_playwright().start()
-        _browser = _pw.chromium.launch(
-            headless=True,
+        _context = _pw.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE_DIR),
+            headless=HEADLESS,
+            user_agent=PC_UA,
+            viewport={"width": 1366, "height": 768},
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            bypass_csp=True,
+            device_scale_factor=2,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
+                "--disable-dev-shm-usage",
             ],
         )
-        _context = _browser.new_context(
-            user_agent=MOBILE_UA,
-            viewport={"width": 390, "height": 844},
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-            # 让 navigator.webdriver 不返回 true,反检测
-            bypass_csp=True,
-        )
-        # 在所有页面加载前注入反检测脚本
         _context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            window.chrome = { runtime: {} };
         """)
         print("  [pw] 浏览器就绪")
     return _context
 
 
+def _dump_debug(page: Page, label: str) -> None:
+    """保存当前页面的截图 + HTML,辅助调试 '为什么没找到视频'。"""
+    DEBUG_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        png = DEBUG_DUMP_DIR / f"{label}.png"
+        html = DEBUG_DUMP_DIR / f"{label}.html"
+        page.screenshot(path=str(png), full_page=True)
+        html.write_text(page.content(), encoding="utf-8")
+        print(f"  [pw-download] 调试快照已存: {png} / {html.name}")
+    except Exception as e:
+        print(f"  [pw-download] 调试 dump 失败: {e}")
+
+
 def _cleanup_browser() -> None:
     """进程退出时清理。atexit 自动调用。"""
-    global _pw, _browser, _context
+    global _pw, _context
     try:
         if _context is not None:
             _context.close()
-        if _browser is not None:
-            _browser.close()
         if _pw is not None:
             _pw.stop()
     except Exception:
         pass
     _context = None
-    _browser = None
     _pw = None
 
 
@@ -155,12 +178,83 @@ def _extract_metadata(page: Page) -> dict:
     """)
 
 
-def _fetch_blob_via_page(page: Page, blob_url: str) -> bytes | None:
-    """blob: URL 不能 HTTP 直接 GET,用页面内 fetch + FileReader 取 base64。"""
+FRAME_PCTS = [0.10, 0.35, 0.60, 0.85]
+
+
+def _capture_video_frames(
+    page: Page,
+    output_dir: Path,
+    video_id: str,
+    duration: float,
+    n_frames: int = 4,
+) -> list[Path]:
+    """直接对 <video> 元素 screenshot 抽帧 — 绕过 mp4 下载。
+    抖音的 secsdk 拦 fetch 但拦不了浏览器内截图。
+    只截 <video> 元素 bounding box,不包含周边 UI。
+    """
+    if not duration or duration < 1:
+        return []
+
+    pcts = FRAME_PCTS[:n_frames]
+    timestamps = [max(0.5, duration * p) for p in pcts]
+    frame_paths: list[Path] = []
+
+    # 先暂停,避免播放中截图模糊
+    try:
+        page.evaluate("document.querySelector('video').pause()")
+    except Exception:
+        pass
+
+    video_loc = page.locator("video").first
+
+    for i, t in enumerate(timestamps):
+        try:
+            # seek 到目标时间
+            page.evaluate(f"""
+                () => {{
+                    const v = document.querySelector('video');
+                    if (v) v.currentTime = {t};
+                }}
+            """)
+            # 等 seek 完成 + readyState 足够
+            page.wait_for_function(
+                f"""
+                () => {{
+                    const v = document.querySelector('video');
+                    return v && Math.abs(v.currentTime - {t}) < 0.3 && v.readyState >= 2;
+                }}
+                """,
+                timeout=5000,
+            )
+            # 让帧稳定一下(渲染管线)
+            page.wait_for_timeout(250)
+
+            frame_path = output_dir / f"{video_id}_f{i+1}.jpg"
+            video_loc.screenshot(
+                path=str(frame_path),
+                type="jpeg",
+                quality=85,
+            )
+            if frame_path.exists() and frame_path.stat().st_size > 1024:
+                frame_paths.append(frame_path)
+                print(f"  [pw-frames] 帧 {i+1} @ t={t:.1f}s · {frame_path.stat().st_size//1024} KB")
+        except Exception as e:
+            print(f"  [pw-frames] 帧 {i+1} @ t={t:.1f}s 失败: {e}")
+            continue
+
+    return frame_paths
+
+
+def _fetch_via_page(page: Page, url: str) -> bytes | None:
+    """通过页面自己的 fetch 下载任意 URL(http/https/blob)。
+    页面上下文自动带 Referer、cookies、UA 等,绕过 403 类问题。
+    返回二进制,失败返回 None。
+    """
     try:
         b64 = page.evaluate("""
             async (url) => {
-                const r = await fetch(url);
+                const r = await fetch(url, { credentials: 'include' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
                 const b = await r.blob();
                 return await new Promise((resolve, reject) => {
                     const reader = new FileReader();
@@ -169,10 +263,10 @@ def _fetch_blob_via_page(page: Page, blob_url: str) -> bytes | None:
                     reader.readAsDataURL(b);
                 });
             }
-        """, blob_url)
+        """, url)
         return base64.b64decode(b64)
     except Exception as e:
-        print(f"  [pw-download] blob 读取失败: {e}")
+        print(f"  [pw-download] 页面 fetch 失败: {e}")
         return None
 
 
@@ -206,12 +300,30 @@ def download_video(url: str, output_dir: Path | str, video_id: str | None = None
             return None
 
         # 给前端一点时间让 video 元素挂载(抖音是 SPA)
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(3000)
+
+        # 检测常见拦截:登录墙 / 二维码弹窗 / "打开 App" 提示
+        wall = page.evaluate("""
+            () => {
+                const text = (document.body && document.body.innerText) || '';
+                const hits = [];
+                if (text.includes('打开APP') || text.includes('打开抖音')) hits.push('open_app');
+                if (text.includes('登录') && text.length < 1500) hits.push('login_wall');
+                if (text.includes('扫码下载')) hits.push('download_app');
+                return hits.length ? hits.join(',') : null;
+            }
+        """)
+        if wall:
+            print(f"  [pw-download] 检测到拦截页面: {wall}")
+            if DEBUG_DUMP:
+                _dump_debug(page, f"{video_id}_wall")
 
         # ============ 2. 等 video 元素加载 ============
         video_info = _wait_for_video(page, timeout_ms=20000)
         if not video_info or not video_info.get("src"):
             print(f"  [pw-download] DOM 中未找到视频源")
+            # 不管 DEBUG_DUMP,失败时一律存快照(辅助你排查)
+            _dump_debug(page, f"{video_id}_no_video")
             return None
 
         video_src = video_info["src"]
@@ -222,38 +334,24 @@ def download_video(url: str, output_dir: Path | str, video_id: str | None = None
         title = meta.get("og_title") or meta.get("title") or ""
         caption = meta.get("og_description") or meta.get("description") or title
 
-        # ============ 4. 下载视频文件 ============
-        output_path = output_dir / f"{video_id}.mp4"
-
-        if video_src.startswith("blob:"):
-            # blob URL → 通过页面内 fetch
-            print(f"  [pw-download] blob: URL,通过页面 fetch")
-            data = _fetch_blob_via_page(page, video_src)
-            if not data:
-                return None
-            output_path.write_bytes(data)
-        else:
-            # 直接 HTTP — 用 browser context 的 request(带 cookies/UA)
-            try:
-                resp = ctx.request.get(video_src, timeout=30000)
-                if resp.status != 200:
-                    print(f"  [pw-download] 视频源 HTTP {resp.status}")
-                    return None
-                output_path.write_bytes(resp.body())
-            except Exception as e:
-                print(f"  [pw-download] 视频下载失败: {e}")
-                return None
-
-        file_size = output_path.stat().st_size
-        if file_size < 1024:
-            print(f"  [pw-download] 下载文件过小({file_size} bytes),可能失败")
+        # ============ 4. 截图抽帧(取代 mp4 下载) ============
+        # 抖音 secsdk 拦 fetch 但拦不了浏览器内截图。
+        # 直接对 <video> 元素 screenshot,只截视频内容区域。
+        print(f"  [pw-download] 直接对 video 元素截图抽帧...")
+        frame_paths = _capture_video_frames(
+            page, output_dir, video_id, duration=duration or 10, n_frames=4
+        )
+        if not frame_paths:
+            print(f"  [pw-download] 没抽到任何帧")
+            _dump_debug(page, f"{video_id}_no_frames")
             return None
 
         elapsed = time.time() - t0
-        print(f"  [pw-download] ✓ 视频 {file_size//1024} KB · {duration:.1f}s · 耗时 {elapsed:.1f}s")
+        print(f"  [pw-download] ✓ 抽到 {len(frame_paths)} 帧 · 耗时 {elapsed:.1f}s")
 
         return {
-            "video_path": str(output_path),
+            "video_path": None,  # 没下 mp4
+            "frame_paths": [str(p) for p in frame_paths],
             "title": title,
             "caption": caption,
             "duration": int(duration) if duration else None,
@@ -261,7 +359,7 @@ def download_video(url: str, output_dir: Path | str, video_id: str | None = None
             "thumbnail": meta.get("og_image"),
             "width": video_info.get("width"),
             "height": video_info.get("height"),
-            "upload_date": None,  # Playwright 路径不提供,留空
+            "upload_date": None,
         }
 
     except Exception as e:

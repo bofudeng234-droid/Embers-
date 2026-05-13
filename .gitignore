@@ -14,3 +14,9 @@ env/
 .idea/
 node_modules/
 .wrangler/
+
+# 临时下载 / 调试快照(不该进 git)
+data/_debug/
+data/_test_download/
+data/_test_frames/
+data/embers.db*

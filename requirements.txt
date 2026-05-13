@@ -28,3 +28,8 @@ faster-whisper>=1.0.0
 
 # 图像处理(VLM 前置编码)
 pillow>=10.0.0
+
+# === v0.3 真多模态 · CLIP 本地视觉编码 ===
+torch>=2.2.0
+transformers>=4.40.0
+numpy>=1.26.0

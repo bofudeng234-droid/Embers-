@@ -34,9 +34,8 @@ import pandas as pd
 from tqdm import tqdm
 
 from pipeline import store, embed
+from pipeline import clip_embed
 from pipeline.download import download_video
-from pipeline.frames import extract_frames, get_duration
-from pipeline.transcribe import transcribe
 from pipeline.vision import describe_frames
 
 
@@ -52,27 +51,34 @@ def process_one(url: str, video_id: str, tmp_root: Path) -> dict[str, Any] | Non
     work_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # ============ 1. 下载 ============
-        print(f"  · 下载...")
-        meta = download_video(url, work_dir)
+        # ============ 1. 打开页面 + 抽帧 + 抓 caption(一站式) ============
+        print(f"  · Playwright 打开页面 + 截图抽帧...")
+        meta = download_video(url, work_dir, video_id=video_id)
         if not meta:
-            print(f"  ✗ 下载失败,跳过")
+            print(f"  ✗ 页面处理失败,跳过")
             return None
-        video_path = meta["video_path"]
         duration = meta.get("duration")
-        print(f"  ✓ 下载完成 · {duration}s · caption: {(meta.get('caption') or '')[:50]}")
+        frame_paths = [Path(p) for p in meta.get("frame_paths", [])]
+        print(f"  ✓ 完成 · {duration}s · {len(frame_paths)} 帧 · caption: {(meta.get('caption') or '')[:50]}")
 
-        # ============ 2. 抽帧 ============
-        print(f"  · 抽帧 4 张...")
-        frame_paths = extract_frames(video_path, work_dir, n_frames=4, duration=duration)
-        print(f"  ✓ 抽到 {len(frame_paths)} 帧")
+        # ============ 2. 转写(skip · 无 mp4) ============
+        # v0.2 用 Playwright 直接截图,放弃 mp4 下载,因此没有音频可转写
+        # 后续如果用 Playwright 录屏(page.video())可以恢复 Whisper 一路信号
+        transcript = ""
 
-        # ============ 3. 转写 ============
-        print(f"  · Whisper 转写...")
-        transcript = transcribe(video_path)
-        print(f"  ✓ 转写完成 · {len(transcript)} 字 · {transcript[:60]}{'...' if len(transcript) > 60 else ''}")
+        # ============ 3a. CLIP 视觉向量(真多模态)============
+        image_vec = None
+        if frame_paths:
+            try:
+                print(f"  · CLIP 视觉编码 {len(frame_paths)} 帧...")
+                frame_vecs = clip_embed.images_to_vecs(frame_paths)
+                image_vec = clip_embed.average_image_vecs(frame_vecs)
+                print(f"  ✓ 视觉向量就绪 · {len(image_vec)}d")
+            except Exception as e:
+                print(f"  ✗ CLIP 编码失败,跳过视觉向量: {e}")
+                image_vec = None
 
-        # ============ 4. VLM 描述 ============
+        # ============ 3b. VLM 文字描述帧(语义补充)============
         print(f"  · VLM 描述 {len(frame_paths)} 帧...")
         frame_descs = describe_frames(frame_paths) if frame_paths else []
         # 过滤空描述
@@ -109,7 +115,7 @@ def process_one(url: str, video_id: str, tmp_root: Path) -> dict[str, Any] | Non
         elapsed = time.time() - t0
         print(f"  ✅ 完成 · 共 {elapsed:.1f}s")
 
-        return {"row": row, "vec": vec}
+        return {"row": row, "vec": vec, "image_vec": image_vec}
 
     except Exception as e:
         print(f"  ✗ 异常: {e}")
@@ -150,7 +156,10 @@ def main(csv_path: str) -> None:
                 failed += 1
                 continue
 
-            store.upsert_video(conn, result["row"], result["vec"])
+            store.upsert_video(
+                conn, result["row"], result["vec"],
+                image_embedding=result.get("image_vec"),
+            )
             succeeded += 1
 
         total = store.count(conn)
