@@ -38,6 +38,15 @@ from pipeline import clip_embed
 from pipeline.download import download_video
 from pipeline.vision import describe_frames
 
+# v0.4 音频路 · 容错导入(CLAP / Whisper 装不上时 ingest 仍能跑,只是缺音频信号)
+try:
+    from pipeline import clap_embed
+    from pipeline.transcribe import transcribe
+    AUDIO_AVAILABLE = True
+except Exception as _e:
+    print(f"[ingest] 音频路不可用(将跳过): {_e}")
+    AUDIO_AVAILABLE = False
+
 
 def process_one(url: str, video_id: str, tmp_root: Path) -> dict[str, Any] | None:
     """处理单条 URL,返回准备好的 row dict(含 embedding_text + frame_desc JSON)。
@@ -61,10 +70,25 @@ def process_one(url: str, video_id: str, tmp_root: Path) -> dict[str, Any] | Non
         frame_paths = [Path(p) for p in meta.get("frame_paths", [])]
         print(f"  ✓ 完成 · {duration}s · {len(frame_paths)} 帧 · caption: {(meta.get('caption') or '')[:50]}")
 
-        # ============ 2. 转写(skip · 无 mp4) ============
-        # v0.2 用 Playwright 直接截图,放弃 mp4 下载,因此没有音频可转写
-        # 后续如果用 Playwright 录屏(page.video())可以恢复 Whisper 一路信号
+        # ============ 2a. CLAP 音频向量 + Whisper 转写(v0.4) ============
+        # 只有抓到 mp4 时才跑(response interception 命中)
         transcript = ""
+        audio_vec = None
+        video_path = meta.get("video_path")
+        if AUDIO_AVAILABLE and video_path:
+            try:
+                print(f"  · CLAP 音频编码 + Whisper 转写...")
+                audio_vec = clap_embed.audio_to_vec(video_path)
+                print(f"  ✓ 音频向量 · {len(audio_vec)}d")
+                transcript = transcribe(video_path)
+                if transcript:
+                    print(f"  ✓ 转写 · {len(transcript)} 字 · {transcript[:50]}{'...' if len(transcript) > 50 else ''}")
+            except Exception as e:
+                print(f"  ✗ 音频处理失败,继续走纯视觉路: {e}")
+                audio_vec = None
+                transcript = ""
+        elif not video_path:
+            print(f"  · (没有 mp4,跳过音频路)")
 
         # ============ 3a. CLIP 视觉向量(真多模态)============
         image_vec = None
@@ -115,7 +139,7 @@ def process_one(url: str, video_id: str, tmp_root: Path) -> dict[str, Any] | Non
         elapsed = time.time() - t0
         print(f"  ✅ 完成 · 共 {elapsed:.1f}s")
 
-        return {"row": row, "vec": vec, "image_vec": image_vec}
+        return {"row": row, "vec": vec, "image_vec": image_vec, "audio_vec": audio_vec}
 
     except Exception as e:
         print(f"  ✗ 异常: {e}")
@@ -159,6 +183,7 @@ def main(csv_path: str) -> None:
             store.upsert_video(
                 conn, result["row"], result["vec"],
                 image_embedding=result.get("image_vec"),
+                audio_embedding=result.get("audio_vec"),
             )
             succeeded += 1
 

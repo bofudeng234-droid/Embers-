@@ -32,8 +32,15 @@ try:
     from pipeline import clip_embed
     CLIP_AVAILABLE = True
 except Exception as _e:
-    print(f"[server] CLIP 不可用(将只用文本检索): {_e}")
+    print(f"[server] CLIP 不可用: {_e}")
     CLIP_AVAILABLE = False
+
+try:
+    from pipeline import clap_embed
+    CLAP_AVAILABLE = True
+except Exception as _e:
+    print(f"[server] CLAP 不可用: {_e}")
+    CLAP_AVAILABLE = False
 
 load_dotenv()
 
@@ -107,10 +114,12 @@ class HealthResponse(BaseModel):
     status: str
     video_count: int
     video_count_with_image: int
+    video_count_with_audio: int
     embedding_dim: int
     embedding_provider: str
     llm_provider: str
     clip_available: bool
+    clap_available: bool
 
 
 class VideoRow(BaseModel):
@@ -157,10 +166,12 @@ def health():
             status="ok",
             video_count=store.count(conn),
             video_count_with_image=store.count_with_image(conn),
+            video_count_with_audio=store.count_with_audio(conn),
             embedding_dim=store.EMBEDDING_DIM,
             embedding_provider=embed.PROVIDER,
             llm_provider=LLM_PROVIDER,
             clip_available=CLIP_AVAILABLE,
+            clap_available=CLAP_AVAILABLE,
         )
     finally:
         conn.close()
@@ -191,28 +202,22 @@ def list_videos(limit: int = 200, offset: int = 0):
         conn.close()
 
 
-def _rrf_fuse(text_hits: list[dict], image_hits: list[dict], k: int = 60) -> list[dict]:
-    """Reciprocal Rank Fusion · 把文本路和视觉路的命中按"倒数排名分"加权融合。
-    经典 hybrid retrieval 算法,公式:score(d) = Σ 1 / (k + rank(d))
+def _rrf_fuse(*hit_lists_named: tuple[str, list[dict]], k: int = 60) -> list[dict]:
+    """N 路 RRF 融合 · 标签每路命中来源。
+    每路 hit_lists_named 是 (name, hits) tuple,name 是 "text" / "image" / "audio"。
     """
     scores: dict[str, float] = {}
     payload: dict[str, dict] = {}
 
-    for rank, h in enumerate(text_hits):
-        vid = h["id"]
-        scores[vid] = scores.get(vid, 0.0) + 1.0 / (k + rank)
-        payload.setdefault(vid, h).setdefault("_source", set()).add("text")
+    for source_name, hits in hit_lists_named:
+        for rank, h in enumerate(hits):
+            vid = h["id"]
+            scores[vid] = scores.get(vid, 0.0) + 1.0 / (k + rank)
+            d = payload.setdefault(vid, h)
+            d.setdefault("_source", set()).add(source_name)
+            if h.get("distance", 1e9) < d.get("distance", 1e9):
+                d["distance"] = h["distance"]
 
-    for rank, h in enumerate(image_hits):
-        vid = h["id"]
-        scores[vid] = scores.get(vid, 0.0) + 1.0 / (k + rank)
-        d = payload.setdefault(vid, h)
-        d.setdefault("_source", set()).add("image")
-        # 用更小的 distance(更近的命中)
-        if h.get("distance", 1e9) < d.get("distance", 1e9):
-            d["distance"] = h["distance"]
-
-    # 按融合得分降序
     sorted_ids = sorted(scores.keys(), key=lambda v: -scores[v])
     out: list[dict] = []
     for vid in sorted_ids:
@@ -239,25 +244,35 @@ def search(req: SearchRequest):
         try:
             q_image_vec = clip_embed.text_to_vec(q_text)
         except Exception as e:
-            print(f"  [/search] CLIP 编码失败,降级到纯文本检索: {e}")
-            q_image_vec = None
+            print(f"  [/search] CLIP 编码失败: {e}")
 
-    # ============ 双轨检索 ============
+    q_audio_vec: list[float] | None = None
+    if CLAP_AVAILABLE:
+        try:
+            q_audio_vec = clap_embed.text_to_vec(q_text)
+        except Exception as e:
+            print(f"  [/search] CLAP 编码失败: {e}")
+
+    # ============ 三轨检索 ============
     conn = get_conn()
     try:
         text_hits = store.search_text(conn, q_text_vec, top_k=req.top_k * 2)
         image_hits: list[dict] = []
+        audio_hits: list[dict] = []
         if q_image_vec is not None and store.count_with_image(conn) > 0:
             image_hits = store.search_image(conn, q_image_vec, top_k=req.top_k * 2)
+        if q_audio_vec is not None and store.count_with_audio(conn) > 0:
+            audio_hits = store.search_audio(conn, q_audio_vec, top_k=req.top_k * 2)
     finally:
         conn.close()
 
-    # ============ RRF 融合 ============
+    # ============ RRF 三路融合 ============
+    fuse_inputs: list[tuple[str, list[dict]]] = [("text", text_hits)]
     if image_hits:
-        raw_hits = _rrf_fuse(text_hits, image_hits)[:req.top_k]
-    else:
-        # 没有视觉向量(库还没 ingest CLIP 信号),回退纯文本
-        raw_hits = text_hits[:req.top_k]
+        fuse_inputs.append(("image", image_hits))
+    if audio_hits:
+        fuse_inputs.append(("audio", audio_hits))
+    raw_hits = _rrf_fuse(*fuse_inputs)[:req.top_k] if len(fuse_inputs) > 1 else text_hits[:req.top_k]
 
     explanations: dict[str, str] = {}
     if req.rerank and raw_hits:

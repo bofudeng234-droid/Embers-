@@ -22,6 +22,7 @@ load_dotenv()
 DB_PATH = Path(os.getenv("EMBERS_DB_PATH", "./data/embers.db"))
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "2048"))  # 智谱 embedding-3
 CLIP_DIM = int(os.getenv("CLIP_DIM", "512"))              # Chinese-CLIP base
+CLAP_DIM = int(os.getenv("CLAP_DIM", "512"))              # LAION-CLAP
 
 
 def connect() -> sqlite3.Connection:
@@ -55,6 +56,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
         CREATE VIRTUAL TABLE IF NOT EXISTS vec_images USING vec0(
             embedding float[{CLIP_DIM}]
         );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS vec_audios USING vec0(
+            embedding float[{CLAP_DIM}]
+        );
         """
     )
     conn.commit()
@@ -69,8 +74,9 @@ def upsert_video(
     row: dict,
     text_embedding: list[float],
     image_embedding: list[float] | None = None,
+    audio_embedding: list[float] | None = None,
 ) -> int:
-    """写入一条视频 + 文本向量 + (可选)视觉向量。"""
+    """写入一条视频 + 文本向量 + (可选)视觉向量 + (可选)音频向量。"""
     conn.execute(
         """
         INSERT INTO videos (id, url, title, caption, duration_sec, watched_at,
@@ -106,6 +112,13 @@ def upsert_video(
             (rowid, serialize_vector(image_embedding)),
         )
 
+    # 音频向量(可选 · v0.4 新增)
+    if audio_embedding is not None:
+        conn.execute(
+            "INSERT OR REPLACE INTO vec_audios(rowid, embedding) VALUES (?, ?)",
+            (rowid, serialize_vector(audio_embedding)),
+        )
+
     conn.commit()
     return rowid
 
@@ -118,6 +131,11 @@ def search_text(conn: sqlite3.Connection, query_vec: list[float], top_k: int = 5
 def search_image(conn: sqlite3.Connection, query_vec: list[float], top_k: int = 5) -> list[dict]:
     """视觉向量库检索。"""
     return _search(conn, "vec_images", query_vec, top_k)
+
+
+def search_audio(conn: sqlite3.Connection, query_vec: list[float], top_k: int = 5) -> list[dict]:
+    """音频向量库检索(v0.4)。"""
+    return _search(conn, "vec_audios", query_vec, top_k)
 
 
 def _search(conn, vec_table: str, query_vec: list[float], top_k: int) -> list[dict]:
@@ -157,6 +175,15 @@ def count_with_image(conn: sqlite3.Connection) -> int:
     """有视觉向量的视频数(v0.3 新增)。"""
     try:
         rows = conn.execute("SELECT COUNT(*) FROM vec_images").fetchone()
+        return rows[0] if rows else 0
+    except Exception:
+        return 0
+
+
+def count_with_audio(conn: sqlite3.Connection) -> int:
+    """有音频向量的视频数(v0.4 新增)。"""
+    try:
+        rows = conn.execute("SELECT COUNT(*) FROM vec_audios").fetchone()
         return rows[0] if rows else 0
     except Exception:
         return 0

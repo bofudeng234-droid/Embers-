@@ -33,3 +33,8 @@ pillow>=10.0.0
 torch>=2.2.0
 transformers>=4.40.0
 numpy>=1.26.0
+
+# === v0.4 音频路 · CLAP + Whisper ===
+# Whisper 已在前面 faster-whisper
+librosa>=0.10.0          # audio loading / resampling
+soundfile>=0.12.0        # audio I/O

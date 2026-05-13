@@ -270,8 +270,29 @@ def _fetch_via_page(page: Page, url: str) -> bytes | None:
         return None
 
 
+def _is_video_response(response) -> bool:
+    """判断 HTTP 响应是不是抖音视频 mp4 / m4a 流。"""
+    try:
+        ct = (response.headers or {}).get("content-type", "").lower()
+        url_lower = response.url.lower()
+        # 抖音视频域名(CDN)
+        if "douyinvod" in url_lower or "byteimg" in url_lower:
+            if "video" in ct or "mp4" in ct or "octet-stream" in ct:
+                return True
+        # 兜底:URL 含 .mp4 / playback
+        if ".mp4" in url_lower or "playback" in url_lower or "play_video" in url_lower:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def download_video(url: str, output_dir: Path | str, video_id: str | None = None) -> dict[str, Any] | None:
-    """主入口:URL → 下载视频文件 + 抓 metadata。失败返回 None,不抛异常。"""
+    """主入口:URL → 抽帧 + 截 audio + 抓 metadata。失败返回 None,不抛异常。
+
+    v0.4 关键:用 response interception 被动截获浏览器自己加载的 mp4 流。
+    secsdk 拦 fetch 但拦不了 <video> 元素自身的加载——这是漏洞。
+    """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -283,13 +304,30 @@ def download_video(url: str, output_dir: Path | str, video_id: str | None = None
         print(f"  [pw-download] URL 规范化: → {normalized}")
 
     if not video_id:
-        # 从 URL 抽 id 当文件名
         m = re.search(r'/video/(\d+)', normalized)
         video_id = m.group(1) if m else f"v_{int(time.time())}"
 
     ctx = _ensure_browser()
     page = ctx.new_page()
     t0 = time.time()
+
+    # ============ 0. 设置 response 拦截器(被动截获 mp4 流) ============
+    captured_video: dict[str, Any] = {}
+
+    def _on_response(response):
+        if captured_video.get("bytes"):
+            return  # 已经拿到了
+        if _is_video_response(response):
+            try:
+                body = response.body()
+                if body and len(body) > 100_000:  # 至少 100KB 才算视频
+                    captured_video["bytes"] = body
+                    captured_video["url"] = response.url
+                    captured_video["size"] = len(body)
+            except Exception:
+                pass
+
+    page.on("response", _on_response)
 
     try:
         # ============ 1. 打开页面 ============
@@ -334,6 +372,24 @@ def download_video(url: str, output_dir: Path | str, video_id: str | None = None
         title = meta.get("og_title") or meta.get("title") or ""
         caption = meta.get("og_description") or meta.get("description") or title
 
+        # ============ 3.5 等视频完整缓冲(让 response 拦截器收完 mp4) ============
+        try:
+            page.wait_for_function(
+                """
+                () => {
+                    const v = document.querySelector('video');
+                    if (!v || !v.duration) return false;
+                    for (let i = 0; i < v.buffered.length; i++) {
+                        if (v.buffered.end(i) >= v.duration - 0.5) return true;
+                    }
+                    return false;
+                }
+                """,
+                timeout=15000,
+            )
+        except PWTimeout:
+            print(f"  [pw-download] ⚠ 视频缓冲超时,继续(音频可能不完整)")
+
         # ============ 4. 截图抽帧(取代 mp4 下载) ============
         # 抖音 secsdk 拦 fetch 但拦不了浏览器内截图。
         # 直接对 <video> 元素 screenshot,只截视频内容区域。
@@ -346,11 +402,21 @@ def download_video(url: str, output_dir: Path | str, video_id: str | None = None
             _dump_debug(page, f"{video_id}_no_frames")
             return None
 
+        # ============ 5. 保存被拦截的 mp4(若拿到) ============
+        video_path: str | None = None
+        if captured_video.get("bytes"):
+            mp4 = output_dir / f"{video_id}.mp4"
+            mp4.write_bytes(captured_video["bytes"])
+            video_path = str(mp4)
+            print(f"  [pw-download] ✓ 截获 mp4 流 · {captured_video['size']//1024} KB")
+        else:
+            print(f"  [pw-download] ⚠ 没拦到 mp4(无音频,纯视觉)")
+
         elapsed = time.time() - t0
         print(f"  [pw-download] ✓ 抽到 {len(frame_paths)} 帧 · 耗时 {elapsed:.1f}s")
 
         return {
-            "video_path": None,  # 没下 mp4
+            "video_path": video_path,
             "frame_paths": [str(p) for p in frame_paths],
             "title": title,
             "caption": caption,
