@@ -118,8 +118,9 @@ class VideoRow(BaseModel):
     url: str
     title: str | None = None
     caption: str | None = None
-    hashtags: str | None = None
-    notes: str | None = None
+    transcript: str | None = None
+    frame_desc: str | None = None
+    duration_sec: int | None = None
     watched_at: str | None = None
 
 
@@ -171,7 +172,7 @@ def list_videos(limit: int = 200, offset: int = 0):
     try:
         rows = conn.execute(
             """
-            SELECT id, url, title, caption, hashtags, notes, watched_at
+            SELECT id, url, title, caption, transcript, frame_desc, duration_sec, watched_at
             FROM videos
             ORDER BY watched_at DESC NULLS LAST
             LIMIT ? OFFSET ?
@@ -181,7 +182,8 @@ def list_videos(limit: int = 200, offset: int = 0):
         return [
             VideoRow(
                 id=r[0], url=r[1], title=r[2], caption=r[3],
-                hashtags=r[4], notes=r[5], watched_at=r[6],
+                transcript=r[4], frame_desc=r[5],
+                duration_sec=r[6], watched_at=r[7],
             )
             for r in rows
         ]
@@ -267,7 +269,8 @@ def search(req: SearchRequest):
     hits = [
         SearchHit(
             id=h["id"], url=h["url"], title=h["title"], caption=h["caption"],
-            hashtags=h["hashtags"], notes=h["notes"], watched_at=h["watched_at"],
+            transcript=h.get("transcript"), frame_desc=h.get("frame_desc"),
+            duration_sec=h.get("duration_sec"), watched_at=h.get("watched_at"),
             distance=h["distance"],
             explanation=explanations.get(h["id"]),
         )

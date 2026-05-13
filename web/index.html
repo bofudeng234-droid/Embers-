@@ -270,7 +270,7 @@ async function loadWall() {
       <div class="video" data-id="${v.id}" onclick="window.open('${v.url}', '_blank')">
         <div class="vid-id">${v.id}</div>
         <div class="vid-title">${escape(v.title || v.caption || '(无标题)')}</div>
-        <div class="vid-meta">${escape(v.notes || v.caption || '')}</div>
+        <div class="vid-meta">${escape(v.caption || v.transcript || '')}</div>
       </div>
     `).join('');
   } catch (e) {
@@ -337,18 +337,25 @@ async function doSearch(query) {
         <h2>${litCount} 颗余烬被点亮 · ${j.hits.length} 条候选 · "${escape(j.query)}"</h2>
         <span class="meta">${j.latency_ms} ms</span>
       </div>
-      ${j.hits.map((h, i) => `
-        <div class="hit">
-          <div class="hit-head">
-            <div class="hit-title">${i + 1}. ${escape(h.title || h.caption || h.id)}</div>
-            <div class="hit-distance">d=${h.distance.toFixed(4)}</div>
+      ${j.hits.map((h, i) => {
+        let frameDescs = [];
+        if (h.frame_desc) {
+          try { frameDescs = JSON.parse(h.frame_desc); } catch(_) {}
+        }
+        return `
+          <div class="hit">
+            <div class="hit-head">
+              <div class="hit-title">${i + 1}. ${escape(h.title || h.caption || h.id)}</div>
+              <div class="hit-distance">d=${h.distance.toFixed(4)}</div>
+            </div>
+            ${h.caption ? `<div class="hit-caption">${escape(h.caption)}</div>` : ''}
+            ${frameDescs.length ? `<div class="hit-notes">画面: ${frameDescs.map(escape).join(' · ')}</div>` : ''}
+            ${h.transcript ? `<div class="hit-notes">音频: ${escape(h.transcript.slice(0, 100))}${h.transcript.length > 100 ? '...' : ''}</div>` : ''}
+            ${h.explanation ? `<div class="hit-explanation">${escape(h.explanation)}</div>` : ''}
+            <a href="${h.url}" target="_blank">打开 →</a>
           </div>
-          ${h.notes ? `<div class="hit-notes">"${escape(h.notes)}"</div>` : ''}
-          ${h.caption ? `<div class="hit-caption">${escape(h.caption)}</div>` : ''}
-          ${h.explanation ? `<div class="hit-explanation">${escape(h.explanation)}</div>` : ''}
-          <a href="${h.url}" target="_blank">打开 →</a>
-        </div>
-      `).join('')}
+        `;
+      }).join('')}
     `;
   } catch (e) {
     results.innerHTML = '<div class="empty">搜索失败。' + e.message + '</div>';

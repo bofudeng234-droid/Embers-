@@ -65,14 +65,54 @@ def dim() -> int:
     return int(m.config.projection_dim)
 
 
+def _to_tensor(out, m, modality: str) -> torch.Tensor:
+    """版本兼容:不同 transformers 版本下 get_*_features 的返回类型不一致。
+       - 新版本直接返回 tensor
+       - 老版本返回 BaseModelOutputWithPooling
+       - pooler_output 可能是 [hidden_dim](需投影)或 [projection_dim](已投影,直接用)
+    """
+    if isinstance(out, torch.Tensor):
+        return out
+
+    proj_dim = getattr(m.config, "projection_dim", None)
+    proj = m.visual_projection if modality == "image" else m.text_projection
+    proj_in = getattr(proj, "in_features", None)
+    proj_out = getattr(proj, "out_features", None)
+
+    if hasattr(out, "pooler_output") and out.pooler_output is not None:
+        pool = out.pooler_output
+        d = pool.shape[-1]
+        # 已经是投影后维度 → 直接返回
+        if proj_dim is not None and d == proj_dim:
+            return pool
+        if proj_out is not None and d == proj_out:
+            return pool
+        # 是 encoder 隐层维度 → 应用 projection
+        if proj_in is not None and d == proj_in:
+            return proj(pool)
+        # 维度对不上任何已知值,先按"原样用"试,normalize 不会因维度错
+        return pool
+
+    if modality == "image" and hasattr(out, "image_embeds") and out.image_embeds is not None:
+        return out.image_embeds
+    if modality == "text" and hasattr(out, "text_embeds") and out.text_embeds is not None:
+        return out.text_embeds
+    raise TypeError(f"无法从 {type(out).__name__} 提取 {modality} 特征")
+
+
+def _normalize(t: torch.Tensor) -> torch.Tensor:
+    """L2 归一化到单位长度,方便后续 cosine 相似度直接用 dot product。"""
+    return t / t.norm(dim=-1, keepdim=True)
+
+
 def image_to_vec(path: str | Path) -> list[float]:
     """图片 → 单位长度的 512d 向量。失败抛异常(让上层决定怎么处理)。"""
     m, p = load()
     image = Image.open(path).convert("RGB")
     inputs = p(images=image, return_tensors="pt").to(_device)
     with torch.no_grad():
-        feats = m.get_image_features(**inputs)
-        feats = feats / feats.norm(dim=-1, keepdim=True)
+        raw = m.get_image_features(**inputs)
+        feats = _normalize(_to_tensor(raw, m, "image"))
     return feats.squeeze(0).cpu().numpy().astype(np.float32).tolist()
 
 
@@ -84,8 +124,8 @@ def images_to_vecs(paths: list[str | Path]) -> list[list[float]]:
     images = [Image.open(pp).convert("RGB") for pp in paths]
     inputs = p(images=images, return_tensors="pt").to(_device)
     with torch.no_grad():
-        feats = m.get_image_features(**inputs)
-        feats = feats / feats.norm(dim=-1, keepdim=True)
+        raw = m.get_image_features(**inputs)
+        feats = _normalize(_to_tensor(raw, m, "image"))
     return [feats[i].cpu().numpy().astype(np.float32).tolist() for i in range(feats.shape[0])]
 
 
@@ -94,8 +134,8 @@ def text_to_vec(text: str) -> list[float]:
     m, p = load()
     inputs = p(text=[text], padding=True, return_tensors="pt").to(_device)
     with torch.no_grad():
-        feats = m.get_text_features(**inputs)
-        feats = feats / feats.norm(dim=-1, keepdim=True)
+        raw = m.get_text_features(**inputs)
+        feats = _normalize(_to_tensor(raw, m, "text"))
     return feats.squeeze(0).cpu().numpy().astype(np.float32).tolist()
 
 
