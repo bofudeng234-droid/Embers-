@@ -13,7 +13,7 @@ from pathlib import Path
 
 from faster_whisper import WhisperModel
 
-WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "base")  # 默认 base · 75MB
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
 WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "auto")
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "zh")

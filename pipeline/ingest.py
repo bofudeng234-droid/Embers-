@@ -70,22 +70,29 @@ def process_one(url: str, video_id: str, tmp_root: Path) -> dict[str, Any] | Non
         frame_paths = [Path(p) for p in meta.get("frame_paths", [])]
         print(f"  ✓ 完成 · {duration}s · {len(frame_paths)} 帧 · caption: {(meta.get('caption') or '')[:50]}")
 
-        # ============ 2a. CLAP 音频向量 + Whisper 转写(v0.4) ============
-        # 只有抓到 mp4 时才跑(response interception 命中)
+        # ============ 2a. CLAP 音频向量(v0.4) ============
         transcript = ""
         audio_vec = None
         video_path = meta.get("video_path")
         if AUDIO_AVAILABLE and video_path:
             try:
-                print(f"  · CLAP 音频编码 + Whisper 转写...")
+                print(f"  · CLAP 音频编码...")
                 audio_vec = clap_embed.audio_to_vec(video_path)
                 print(f"  ✓ 音频向量 · {len(audio_vec)}d")
+            except Exception as e:
+                print(f"  ✗ CLAP 失败,跳过音频向量: {e}")
+                audio_vec = None
+
+            # 2b. Whisper 转写(独立 try,跟 CLAP 互不影响)
+            try:
+                print(f"  · Whisper 转写...")
                 transcript = transcribe(video_path)
                 if transcript:
                     print(f"  ✓ 转写 · {len(transcript)} 字 · {transcript[:50]}{'...' if len(transcript) > 50 else ''}")
+                else:
+                    print(f"  · (转写为空,可能没人声)")
             except Exception as e:
-                print(f"  ✗ 音频处理失败,继续走纯视觉路: {e}")
-                audio_vec = None
+                print(f"  ✗ Whisper 失败,跳过转写: {e}")
                 transcript = ""
         elif not video_path:
             print(f"  · (没有 mp4,跳过音频路)")

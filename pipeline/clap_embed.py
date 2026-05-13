@@ -65,16 +65,50 @@ def _load_audio(path: str | Path) -> np.ndarray:
     return audio.astype(np.float32)
 
 
+def _to_tensor(out, m, modality: str) -> torch.Tensor:
+    """兼容 transformers 不同版本:get_*_features 可能返回 tensor 或 ModelOutput。"""
+    if isinstance(out, torch.Tensor):
+        return out
+
+    proj_dim = getattr(m.config, "projection_dim", None)
+    # CLAP 的投影层有几种命名: audio_projection / text_projection
+    proj_attr = "audio_projection" if modality == "audio" else "text_projection"
+    proj = getattr(m, proj_attr, None)
+    proj_in = getattr(proj, "in_features", None) if proj else None
+    proj_out = getattr(proj, "out_features", None) if proj else None
+
+    # 优先用 embeds 字段(若有)
+    embed_attr = f"{modality}_embeds"
+    if hasattr(out, embed_attr) and getattr(out, embed_attr) is not None:
+        return getattr(out, embed_attr)
+
+    if hasattr(out, "pooler_output") and out.pooler_output is not None:
+        pool = out.pooler_output
+        d = pool.shape[-1]
+        if proj_dim is not None and d == proj_dim:
+            return pool
+        if proj_out is not None and d == proj_out:
+            return pool
+        if proj is not None and proj_in is not None and d == proj_in:
+            return proj(pool)
+        return pool
+
+    raise TypeError(f"无法从 {type(out).__name__} 提取 {modality} 特征")
+
+
 def audio_to_vec(path: str | Path) -> list[float]:
     """音频文件 → 单位长度 512d 向量。
     支持 mp3 / wav / m4a / mp4(后者会自动提取音轨)等。
     """
     m, p = load()
     audio = _load_audio(path)
-    inputs = p(audios=audio, sampling_rate=SAMPLE_RATE, return_tensors="pt").to(_device)
+    try:
+        inputs = p(audio=audio, sampling_rate=SAMPLE_RATE, return_tensors="pt").to(_device)
+    except TypeError:
+        inputs = p(audios=audio, sampling_rate=SAMPLE_RATE, return_tensors="pt").to(_device)
     with torch.no_grad():
-        feats = m.get_audio_features(**inputs)
-        feats = _normalize(feats)
+        raw = m.get_audio_features(**inputs)
+        feats = _normalize(_to_tensor(raw, m, "audio"))
     return feats.squeeze(0).cpu().numpy().astype(np.float32).tolist()
 
 
@@ -83,8 +117,8 @@ def text_to_vec(text: str) -> list[float]:
     m, p = load()
     inputs = p(text=[text], return_tensors="pt", padding=True).to(_device)
     with torch.no_grad():
-        feats = m.get_text_features(**inputs)
-        feats = _normalize(feats)
+        raw = m.get_text_features(**inputs)
+        feats = _normalize(_to_tensor(raw, m, "text"))
     return feats.squeeze(0).cpu().numpy().astype(np.float32).tolist()
 
 
