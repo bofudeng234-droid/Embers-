@@ -42,6 +42,15 @@ except Exception as _e:
     print(f"[server] CLAP 不可用: {_e}")
     CLAP_AVAILABLE = False
 
+try:
+    from pipeline.query_expand import expand_query
+    EXPAND_AVAILABLE = True
+except Exception as _e:
+    print(f"[server] query_expand 不可用: {_e}")
+    EXPAND_AVAILABLE = False
+    def expand_query(q: str) -> list[str]:
+        return [q]
+
 load_dotenv()
 
 app = FastAPI(
@@ -137,15 +146,19 @@ class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=500)
     top_k: int = Field(5, ge=1, le=20)
     rerank: bool = Field(False, description="是否启用 LLM 解释(慢一点但更有说服力)")
+    expand: bool = Field(True, description="是否启用 LLM 查询改写(默认开,处理谐音 / 模糊描述)")
 
 
 class SearchHit(VideoRow):
     distance: float
     explanation: str | None = None
+    sources: list[str] = []  # 命中来源:text / image / audio,可多个
+    path_distances: dict[str, float] = {}  # 每一路的真实 distance(用来识别"真匹配 vs 凑数")
 
 
 class SearchResponse(BaseModel):
     query: str
+    expanded_queries: list[str] = []  # LLM 改写后的多个候选(第一个=原 query)
     hits: list[SearchHit]
     latency_ms: int
 
@@ -203,11 +216,10 @@ def list_videos(limit: int = 200, offset: int = 0):
 
 
 def _rrf_fuse(*hit_lists_named: tuple[str, list[dict]], k: int = 60) -> list[dict]:
-    """N 路 RRF 融合 · 标签每路命中来源。
-    每路 hit_lists_named 是 (name, hits) tuple,name 是 "text" / "image" / "audio"。
-    """
+    """N 路 RRF 融合 · 标签每路命中来源 + 每路真实 distance。"""
     scores: dict[str, float] = {}
     payload: dict[str, dict] = {}
+    path_distances: dict[str, dict[str, float]] = {}
 
     for source_name, hits in hit_lists_named:
         for rank, h in enumerate(hits):
@@ -215,6 +227,7 @@ def _rrf_fuse(*hit_lists_named: tuple[str, list[dict]], k: int = 60) -> list[dic
             scores[vid] = scores.get(vid, 0.0) + 1.0 / (k + rank)
             d = payload.setdefault(vid, h)
             d.setdefault("_source", set()).add(source_name)
+            path_distances.setdefault(vid, {})[source_name] = float(h.get("distance", 0))
             if h.get("distance", 1e9) < d.get("distance", 1e9):
                 d["distance"] = h["distance"]
 
@@ -224,6 +237,7 @@ def _rrf_fuse(*hit_lists_named: tuple[str, list[dict]], k: int = 60) -> list[dic
         d = payload[vid]
         d["_score"] = scores[vid]
         d["_source"] = "+".join(sorted(d["_source"]))
+        d["_path_distances"] = path_distances[vid]
         out.append(d)
     return out
 
@@ -233,40 +247,67 @@ def search(req: SearchRequest):
     t0 = time.time()
     q_text = req.query.strip()
 
-    # ============ 双轨向量化 ============
-    try:
-        q_text_vec = embed.embed(q_text)
-    except Exception as e:
-        raise HTTPException(500, f"text embedding 失败: {e}")
-
-    q_image_vec: list[float] | None = None
-    if CLIP_AVAILABLE:
+    # ============ 0. LLM 查询改写(谐音 / 模糊描述展开) ============
+    expanded = [q_text]
+    if req.expand and EXPAND_AVAILABLE:
         try:
-            q_image_vec = clip_embed.text_to_vec(q_text)
+            expanded = expand_query(q_text)
         except Exception as e:
-            print(f"  [/search] CLIP 编码失败: {e}")
+            print(f"  [/search] expand 失败,只用原 query: {e}")
+            expanded = [q_text]
 
-    q_audio_vec: list[float] | None = None
-    if CLAP_AVAILABLE:
+    # ============ 1. 每个改写查询都跑三路检索 ============
+    # 同一路里多个 query 的命中合并,取每条视频的最小 distance
+    merged_text: dict[str, dict] = {}
+    merged_image: dict[str, dict] = {}
+    merged_audio: dict[str, dict] = {}
+
+    for q in expanded:
         try:
-            q_audio_vec = clap_embed.text_to_vec(q_text)
+            q_text_vec = embed.embed(q)
         except Exception as e:
-            print(f"  [/search] CLAP 编码失败: {e}")
+            print(f"  [/search] '{q[:30]}' text embed 失败: {e}")
+            continue
 
-    # ============ 三轨检索 ============
-    conn = get_conn()
-    try:
-        text_hits = store.search_text(conn, q_text_vec, top_k=req.top_k * 2)
-        image_hits: list[dict] = []
-        audio_hits: list[dict] = []
-        if q_image_vec is not None and store.count_with_image(conn) > 0:
-            image_hits = store.search_image(conn, q_image_vec, top_k=req.top_k * 2)
-        if q_audio_vec is not None and store.count_with_audio(conn) > 0:
-            audio_hits = store.search_audio(conn, q_audio_vec, top_k=req.top_k * 2)
-    finally:
-        conn.close()
+        q_image_vec = None
+        if CLIP_AVAILABLE:
+            try:
+                q_image_vec = clip_embed.text_to_vec(q)
+            except Exception:
+                pass
 
-    # ============ RRF 三路融合 ============
+        q_audio_vec = None
+        if CLAP_AVAILABLE:
+            try:
+                q_audio_vec = clap_embed.text_to_vec(q)
+            except Exception:
+                pass
+
+        conn = get_conn()
+        try:
+            for h in store.search_text(conn, q_text_vec, top_k=req.top_k * 2):
+                vid = h["id"]
+                if vid not in merged_text or h["distance"] < merged_text[vid]["distance"]:
+                    merged_text[vid] = h
+            if q_image_vec is not None and store.count_with_image(conn) > 0:
+                for h in store.search_image(conn, q_image_vec, top_k=req.top_k * 2):
+                    vid = h["id"]
+                    if vid not in merged_image or h["distance"] < merged_image[vid]["distance"]:
+                        merged_image[vid] = h
+            if q_audio_vec is not None and store.count_with_audio(conn) > 0:
+                for h in store.search_audio(conn, q_audio_vec, top_k=req.top_k * 2):
+                    vid = h["id"]
+                    if vid not in merged_audio or h["distance"] < merged_audio[vid]["distance"]:
+                        merged_audio[vid] = h
+        finally:
+            conn.close()
+
+    # 转回有序列表(按 distance 升序),供 RRF 排名用
+    text_hits = sorted(merged_text.values(), key=lambda x: x["distance"])
+    image_hits = sorted(merged_image.values(), key=lambda x: x["distance"])
+    audio_hits = sorted(merged_audio.values(), key=lambda x: x["distance"])
+
+    # ============ 2. RRF 三路融合 ============
     fuse_inputs: list[tuple[str, list[dict]]] = [("text", text_hits)]
     if image_hits:
         fuse_inputs.append(("image", image_hits))
@@ -281,6 +322,15 @@ def search(req: SearchRequest):
         except Exception:
             explanations = {}
 
+    def _parse_sources(s) -> list[str]:
+        if not s:
+            return ["text"]
+        if isinstance(s, str):
+            return s.split("+")
+        if isinstance(s, (set, list, tuple)):
+            return sorted(list(s))
+        return ["text"]
+
     hits = [
         SearchHit(
             id=h["id"], url=h["url"], title=h["title"], caption=h["caption"],
@@ -288,12 +338,16 @@ def search(req: SearchRequest):
             duration_sec=h.get("duration_sec"), watched_at=h.get("watched_at"),
             distance=h["distance"],
             explanation=explanations.get(h["id"]),
+            sources=_parse_sources(h.get("_source")),
+            path_distances=h.get("_path_distances", {}),
         )
         for h in raw_hits
     ]
 
     return SearchResponse(
-        query=q_text, hits=hits,
+        query=q_text,
+        expanded_queries=expanded,
+        hits=hits,
         latency_ms=int((time.time() - t0) * 1000),
     )
 
