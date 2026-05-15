@@ -21,6 +21,7 @@ v0.2 多模态 pipeline 编排器
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -178,16 +179,32 @@ def main(csv_path: str) -> None:
     conn = store.connect()
     store.init_schema(conn)
 
+    # v0.9: 跳过已入库的视频(批量 ingest 场景,节省时间和 API 钱)
+    # 用 env FORCE_REINGEST=1 可强制全跑
+    force_reingest = os.getenv("FORCE_REINGEST", "0").lower() in ("1", "true", "yes")
+    existing_ids: set[str] = set()
+    if not force_reingest:
+        rows = conn.execute("SELECT id FROM videos").fetchall()
+        existing_ids = {r[0] for r in rows}
+        if existing_ids:
+            print(f"DB 已有 {len(existing_ids)} 条视频,会自动跳过(设 FORCE_REINGEST=1 可强制重跑)\n")
+
     tmp_root = Path(tempfile.mkdtemp(prefix="embers_"))
     print(f"临时工作区: {tmp_root}\n")
 
     succeeded = 0
     failed = 0
+    skipped = 0
     try:
         for _, csv_row in df.iterrows():
             video_id = str(csv_row["id"])
             url = str(csv_row["url"]).strip()
             if not url or url == "nan":
+                continue
+
+            if video_id in existing_ids:
+                print(f"[{video_id}] 已入库,跳过")
+                skipped += 1
                 continue
 
             result = process_one(url, video_id, tmp_root)
@@ -217,7 +234,7 @@ def main(csv_path: str) -> None:
         total = store.count(conn)
         print(f"\n{'='*60}")
         print(f"✅ 入库完成")
-        print(f"   成功: {succeeded} 条 · 失败: {failed} 条")
+        print(f"   新增: {succeeded} 条 · 跳过: {skipped} 条 · 失败: {failed} 条")
         print(f"   DB 总条数: {total}")
         print(f"   DB 位置:  {store.DB_PATH}")
         print(f"{'='*60}")
