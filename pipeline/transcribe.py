@@ -13,10 +13,12 @@ from pathlib import Path
 
 from faster_whisper import WhisperModel
 
-WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "base")  # 默认 base · 75MB
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")  # v0.8 默认 small · 244MB(中文更准)
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
 WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "auto")
-WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "zh")
+# 空字符串 → 传 None 给 Whisper 触发自动语言检测(支持中英混合 / 外语 BGM)
+_LANG_RAW = os.getenv("WHISPER_LANGUAGE", "").strip()
+WHISPER_LANGUAGE: str | None = _LANG_RAW if _LANG_RAW else None
 
 _model: WhisperModel | None = None
 

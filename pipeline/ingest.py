@@ -47,6 +47,14 @@ except Exception as _e:
     print(f"[ingest] 音频路不可用(将跳过): {_e}")
     AUDIO_AVAILABLE = False
 
+# v0.7 记忆锚点路 · 容错导入(LLM 不可用时降级,不阻塞)
+try:
+    from pipeline import memory_anchors
+    ANCHORS_AVAILABLE = True
+except Exception as _e:
+    print(f"[ingest] anchors 不可用(将跳过): {_e}")
+    ANCHORS_AVAILABLE = False
+
 
 def process_one(url: str, video_id: str, tmp_root: Path) -> dict[str, Any] | None:
     """处理单条 URL,返回准备好的 row dict(含 embedding_text + frame_desc JSON)。
@@ -192,6 +200,18 @@ def main(csv_path: str) -> None:
                 image_embedding=result.get("image_vec"),
                 audio_embedding=result.get("audio_vec"),
             )
+
+            # v0.7: 派生 memory_anchors 并入 vec_anchors
+            if ANCHORS_AVAILABLE:
+                try:
+                    anchors = memory_anchors.extract(result["row"])
+                    if anchors:
+                        rows = memory_anchors.to_anchor_rows(result["row"]["id"], anchors)
+                        n = store.upsert_anchors(conn, result["row"]["id"], rows, embed.embed)
+                        print(f"  · 写入 {n} 条 memory anchors (vibe={anchors.get('vibe')})")
+                except Exception as e:
+                    print(f"  ✗ anchors 失败(跳过): {e}")
+
             succeeded += 1
 
         total = store.count(conn)

@@ -56,29 +56,41 @@ def client() -> OpenAI:
     return _client
 
 
-SYSTEM_PROMPT = """你是视频搜索的"模糊记忆改写器"。用户输入的查询可能是:
+SYSTEM_PROMPT = """你是视频搜索的"模糊记忆改写器"。
 
-1. 谐音(中文音译外语,典型场景是音乐):
-   - "撒发儿啊" → so far away
-   - "扣扣库" → cocoa puff / coco
-   - "嗨皮波斯德 to you" → happy birthday to you
+# 你的任务
 
-2. 模糊描述(用户记不清细节):
-   - "那个洗脑的英文歌" → viral catchy English pop song
-   - "讲创业的那个" → 创业故事 / startup founder talk
+判断用户的 query 属于以下哪类,然后**只在必要时**改写:
 
-3. 已足够具体的描述(无需改写,保留原样):
-   - "猫骑扫地机器人" → 保留
-   - "两个蓝衣球员" → 保留
+## A. 谐音(中文音译外语 — 必须改写)
+- "撒发儿啊" → so far away
+- "扣扣库" → cocoa puff / coco
+- "嗨皮波斯德 to you" → happy birthday to you
 
-你的任务:
-- 第一个永远是用户的原始 query(不要删掉)
-- 其余 1-3 个是改写候选,优先覆盖:外语原词、歌曲/作者名、音乐风格/类型、关键名词扩展
-- 中英文均可输出(CLIP/CLAP 在英文场景效果更好,所以谐音改写出英文是首选)
-- 总数不超过 4 个
+## B. 模糊描述(允许改写 1-2 个候选)
+- "那个洗脑的英文歌" → viral catchy English pop song
+- "讲创业的那个" → 创业故事 / startup founder talk
 
-输出严格的 JSON,格式: {"queries": ["原query", "改写1", "改写2", ...]}
-不要任何其他文字、注释、解释、markdown 标记。"""
+## C. 清晰中文(**不要乱改写,直接原样返回**)
+判断标准: query 是清晰的中文短语,**包含具体名词**(人名、品牌、地名、物品、动物种类、专业术语等),没有外语谐音痕迹。
+- "空军一号飞机餐" → 只返回原句 ❌ 不要翻译成 "Air Force One meal"!!
+- "猫骑扫地机器人" → 只返回原句
+- "两个蓝衣球员" → 只返回原句
+- "戴牛仔帽的鸵鸟" → 只返回原句
+- "炒股问豆包的" → 只返回原句
+
+# 关键规则
+
+1. **第一个永远是用户的原始 query**(不要删掉)
+2. **C 类只返回 1 条**(就是原 query),不要硬凑改写
+3. A 类必须给英文/标准写法;B 类给 1-2 个改写
+4. 总数 ≤ 4
+5. 不要把清晰的中文名词翻译成英文 — 这会污染检索(用户索引的内容是中文)
+
+# 输出格式
+
+严格 JSON,无 markdown,无解释:
+{"queries": ["原query", "改写1?", "改写2?", ...]}"""
 
 
 def expand_query(query: str) -> list[str]:
@@ -100,6 +112,7 @@ def expand_query(query: str) -> list[str]:
             response_format={"type": "json_object"},
             max_tokens=300,
             temperature=0.3,
+            timeout=8.0,  # 超时直接降级为原 query,不让 /search 整体卡住
         )
         text = resp.choices[0].message.content.strip()
         # 容错:有的 LLM 偶尔会包 ```json

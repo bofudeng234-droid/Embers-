@@ -134,11 +134,178 @@ atexit.register(_cleanup_browser)
 
 
 # ============ 核心下载逻辑 ============
-def _wait_for_video(page: Page, timeout_ms: int = 20000) -> dict | None:
-    """等 <video> 元素加载完元数据,返回 {src, duration, width, height}。"""
+def _detect_post_type(page: Page, timeout_ms: int = 12000) -> str:
+    """识别页面是视频帖子还是图集(image gallery)。
+    返回:'video' / 'image' / 'unknown'
+
+    强信号(按可靠度排序):
+      1. <link rel="canonical"> 的 pathname:/note/ → 图集, /video/ → 视频
+         (抖音前端明确标注,最可靠;短链重定向后 location.pathname 不一定同步)
+      2. DOM 标记 data-e2e="note-detail" / "video-detail"
+         (抖音自家的 e2e 测试 hook,比 class 名稳定)
+      3. location.pathname(兜底用,SPA 路由可能滞后)
+
+    不再使用"数大图"启发式 —— 右侧推荐栏的视频封面缩略图(≥400px)
+    会被误判为图集主图,这是之前 v006/v022 被错分流的根因。
+    """
+    return page.evaluate(f"""
+        async () => {{
+            const parsePath = (href) => {{
+                try {{ return new URL(href, location.href).pathname; }} catch (_) {{ return ''; }}
+            }};
+            const isImagePath = (p) => /^\\/(note|share\\/(?:slides|note))\\//.test(p);
+            const isVideoPath = (p) => /^\\/(video|share\\/video)\\//.test(p);
+
+            const check = () => {{
+                // 1. canonical(最强)
+                const canon = document.querySelector('link[rel="canonical"]');
+                if (canon) {{
+                    const p = parsePath(canon.href);
+                    if (isImagePath(p)) return 'image';
+                    if (isVideoPath(p)) return 'video';
+                }}
+                // 2. data-e2e DOM 标记
+                if (document.querySelector('[data-e2e="note-detail"]')) return 'image';
+                if (document.querySelector('[data-e2e="video-detail"]')) return 'video';
+                // 3. location.pathname 兜底
+                if (isImagePath(location.pathname)) return 'image';
+                if (isVideoPath(location.pathname)) return 'video';
+                return null;
+            }};
+
+            const deadline = Date.now() + {timeout_ms};
+            while (Date.now() < deadline) {{
+                const t = check();
+                if (t) return t;
+                await new Promise(r => setTimeout(r, 300));
+            }}
+            return 'unknown';
+        }}
+    """)
+
+
+def _extract_image_urls(page: Page, max_n: int = 4) -> list[str]:
+    """从图集页面抽 N 张主图 URL。
+
+    关键:把查询范围限制在 [data-e2e="note-detail"] 容器内,
+    避免误抓右侧"相关推荐"栏的视频封面缩略图(那也是 ≥400px 的大图)。
+    找不到 note-detail 容器时回退到全局,但全局模式过滤更严。
+    """
+    return page.evaluate("""
+        (max_n) => {
+            const root = document.querySelector('[data-e2e="note-detail"]') || document;
+            const candidates = Array.from(root.querySelectorAll('img'));
+            const filtered = candidates
+                .filter(img => {
+                    const w = img.naturalWidth || img.width || 0;
+                    const h = img.naturalHeight || img.height || 0;
+                    if (w < 300 || h < 300) return false;
+                    const src = img.src || '';
+                    if (!src) return false;
+                    if (src.startsWith('data:')) return false;
+                    if (src.includes('avatar') || src.includes('user_avatar')) return false;
+                    return true;
+                })
+                .map(img => img.src);
+            return [...new Set(filtered)].slice(0, max_n);
+        }
+    """, max_n)
+
+
+def _download_image_post(
+    page: Page,
+    output_dir: Path,
+    video_id: str,
+    max_n: int = 4,
+) -> list[Path]:
+    """图集分支:用 BrowserContext.request 下载主图,绕开 secsdk fetch 拦截。
+
+    secsdk 是注入到页面 JS 的 hook,只能拦页面内的 fetch/XHR,
+    拦不到 Playwright 直接通过浏览器后台发的 context.request。
+    带上 Referer = 当前页面 URL 防 CDN 403。
+    """
+    # 先把图集图滚到视口里触发懒加载(swiper 初始可能只渲染当前页)
     try:
-        page.wait_for_selector("video", timeout=timeout_ms)
-        # 等 readyState >= 1(metadata loaded)就够拿 duration / src
+        page.evaluate("""
+            () => {
+                const imgs = Array.from(document.querySelectorAll('img'))
+                    .filter(img => (img.naturalWidth || 0) >= 400);
+                imgs.forEach(img => img.scrollIntoView({block: 'center'}));
+            }
+        """)
+        page.wait_for_timeout(800)
+    except Exception:
+        pass
+
+    urls = _extract_image_urls(page, max_n=max_n)
+    if not urls:
+        print(f"  [pw-download] 图集页面未抽到主图 URL")
+        return []
+
+    print(f"  [pw-download] 图集:抽到 {len(urls)} 张主图,通过 ctx.request 下载")
+    req = page.context.request
+    referer = page.url
+    paths: list[Path] = []
+    for i, img_url in enumerate(urls, 1):
+        try:
+            resp = req.get(
+                img_url,
+                headers={"Referer": referer, "User-Agent": PC_UA},
+                timeout=15000,
+            )
+            if resp.status != 200:
+                print(f"  [pw-image] 图 {i} HTTP {resp.status}")
+                continue
+            data = resp.body()
+            if not data or len(data) < 1024:
+                print(f"  [pw-image] 图 {i} 太小({len(data) if data else 0}B),跳过")
+                continue
+            p = output_dir / f"{video_id}_f{i}.jpg"
+            p.write_bytes(data)
+            paths.append(p)
+            print(f"  [pw-image] 图 {i} · {len(data)//1024} KB (ctx.request)")
+        except Exception as e:
+            print(f"  [pw-image] 图 {i} 异常: {e}")
+    return paths
+
+
+def _trigger_video_load(page: Page) -> None:
+    """触发 xgplayer 真正开始加载流。
+
+    headless Chromium 经常因为没有用户手势导致 autoplay 被静默阻塞,
+    `<video>` 元素挂上去但 src 永远是空 —— 这是 v006/v015/v017 等
+    一批失败 case 的真实原因。模拟一次点击 + 主动 play() 就能解开。
+    """
+    try:
+        page.evaluate("""
+            () => {
+                const v = document.querySelector('video');
+                if (!v) return;
+                try { v.muted = true; } catch (_) {}
+                try { v.click(); } catch (_) {}
+                try { const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (_) {}
+            }
+        """)
+    except Exception:
+        pass
+
+
+def _wait_for_video(page: Page, timeout_ms: int = 45000) -> dict | None:
+    """等 <video> 元素加载完元数据,返回 {src, duration, width, height}。
+
+    流程:
+      1. 等 <video> 元素出现
+      2. 触发用户手势(点击 + 主动 play),解开 autoplay 阻塞
+      3. 等 readyState >= 1 且有真 src
+    """
+    try:
+        page.wait_for_selector("video", timeout=min(timeout_ms, 15000))
+    except PWTimeout:
+        return None
+
+    _trigger_video_load(page)
+
+    try:
         page.wait_for_function(
             "() => { const v = document.querySelector('video'); return v && v.readyState >= 1 && (v.src || v.currentSrc); }",
             timeout=timeout_ms,
@@ -337,8 +504,8 @@ def download_video(url: str, output_dir: Path | str, video_id: str | None = None
             print(f"  [pw-download] 页面加载超时")
             return None
 
-        # 给前端一点时间让 video 元素挂载(抖音是 SPA)
-        page.wait_for_timeout(3000)
+        # 给前端一点时间让 SPA 完成首屏渲染(后面 _detect_post_type 还会轮询)
+        page.wait_for_timeout(1500)
 
         # 检测常见拦截:登录墙 / 二维码弹窗 / "打开 App" 提示
         wall = page.evaluate("""
@@ -356,13 +523,59 @@ def download_video(url: str, output_dir: Path | str, video_id: str | None = None
             if DEBUG_DUMP:
                 _dump_debug(page, f"{video_id}_wall")
 
+        # ============ 1.5 帖子类型分流(视频 / 图集) ============
+        # _detect_post_type 内部会轮询最长 12s 等真 src,所以这里不需要再额外 sleep。
+        post_type = _detect_post_type(page, timeout_ms=12000)
+        print(f"  [pw-download] 帖子类型: {post_type} (URL: {page.url})")
+        if post_type == "unknown":
+            # 还判不出来 → 兜底当视频处理,沿用旧逻辑(_wait_for_video 会再给一次机会)
+            post_type = "video"
+
+        if post_type == "image":
+            # ---- 图集分支:抓 metadata + 下图,直接返回(无音视频路) ----
+            meta = _extract_metadata(page)
+            title = meta.get("og_title") or meta.get("title") or ""
+            caption = meta.get("og_description") or meta.get("description") or title
+
+            frame_paths = _download_image_post(page, output_dir, video_id, max_n=4)
+            if not frame_paths:
+                print(f"  [pw-download] 图集未抽到图,失败")
+                _dump_debug(page, f"{video_id}_no_images")
+                return None
+
+            elapsed = time.time() - t0
+            print(f"  [pw-download] ✓ 图集 · {len(frame_paths)} 图 · 耗时 {elapsed:.1f}s")
+            return {
+                "video_path": None,
+                "frame_paths": [str(p) for p in frame_paths],
+                "title": title,
+                "caption": caption,
+                "duration": None,
+                "id": video_id,
+                "thumbnail": meta.get("og_image"),
+                "width": None,
+                "height": None,
+                "upload_date": None,
+                "post_type": "image",
+            }
+
         # ============ 2. 等 video 元素加载 ============
-        video_info = _wait_for_video(page, timeout_ms=20000)
+        # _detect_post_type 已经轮询过 src,这里超时设大一点兜底慢加载场景
+        video_info = _wait_for_video(page, timeout_ms=45000)
         if not video_info or not video_info.get("src"):
-            print(f"  [pw-download] DOM 中未找到视频源")
-            # 不管 DEBUG_DUMP,失败时一律存快照(辅助你排查)
-            _dump_debug(page, f"{video_id}_no_video")
-            return None
+            # 一次 reload 重试 —— xgplayer 偶发卡死(autoplay 被阻 / 流注入卡住),
+            # 重新加载后通常能恢复;一次足够,失败概率独立
+            print(f"  [pw-download] 首次拿不到视频源,reload 重试一次...")
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=25000)
+                page.wait_for_timeout(1500)
+                video_info = _wait_for_video(page, timeout_ms=45000)
+            except PWTimeout:
+                video_info = None
+            if not video_info or not video_info.get("src"):
+                print(f"  [pw-download] reload 后仍未找到视频源")
+                _dump_debug(page, f"{video_id}_no_video")
+                return None
 
         video_src = video_info["src"]
         duration = video_info.get("duration") or 0
@@ -426,6 +639,7 @@ def download_video(url: str, output_dir: Path | str, video_id: str | None = None
             "width": video_info.get("width"),
             "height": video_info.get("height"),
             "upload_date": None,
+            "post_type": "video",
         }
 
     except Exception as e:

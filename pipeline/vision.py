@@ -58,8 +58,31 @@ def _encode_image(path: Path) -> str:
     return f"data:image/jpeg;base64,{b64}"
 
 
+FRAME_DESC_PROMPT = """用中文详细描述这一帧画面,60-100 字。
+
+**必须包含以下信息(看到了就写,没有就跳过,不要硬编)**:
+1. 主体: 人/动物/物品 — 具体到品种、品牌、型号(例: "蓝金渐层猫" 而不是 "猫"; "奔驰大G" 而不是 "SUV")
+2. 动作/表情: 在做什么、表情情绪(例: "倒立、嘴角微笑")
+3. 服饰外观: 颜色 + 款式 + 标志性细节(例: "白色瑜伽服 + 红色发带")
+4. 场景: 地点类型 + 标志物 + 时间段(例: "公园湖边台阶,白天")
+5. 字幕/文字: 画面上出现的所有文字内容(标题、字幕、品牌 logo、商品名)
+6. 视觉风格: 主色调、画质感(例: "冷色调、复古滤镜")
+
+**不要写**:
+- "图中" "画面里" 等前缀
+- 引号、markdown、句号外的标点结尾
+- 解释性废话("这是一个有趣的场景"之类)
+
+只输出描述本身。"""
+
+
 def describe_frame(frame_path: str | Path) -> str:
-    """单帧 → 一句中文描述(≤30 字)。失败返回空串。"""
+    """单帧 → 一段中文详细描述(60-100 字)。失败返回空串。
+
+    v0.8 prompt 升级:从 30 字简描升级到 60-100 字结构化描述,
+    显式要求字幕/品牌/配色/品种等区分度信号 — 解决"黑色SUV开门"
+    这种过于通用的描述无法区分多条豪车视频的问题。
+    """
     frame_path = Path(frame_path)
     if not frame_path.exists():
         return ""
@@ -71,14 +94,10 @@ def describe_frame(frame_path: str | Path) -> str:
                 "role": "user",
                 "content": [
                     {"type": "image_url", "image_url": {"url": _encode_image(frame_path)}},
-                    {"type": "text", "text": (
-                        "用一句简洁中文(≤30 字)描述这一帧的核心内容和氛围。"
-                        "重点描述主体、动作、场景。"
-                        "只输出描述,不要前缀、不要引号、不要 markdown。"
-                    )},
+                    {"type": "text", "text": FRAME_DESC_PROMPT},
                 ],
             }],
-            max_tokens=80,
+            max_tokens=250,
             temperature=0.3,
         )
         return (resp.choices[0].message.content or "").strip().strip('"').strip("'")

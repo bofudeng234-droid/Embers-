@@ -51,6 +51,18 @@ except Exception as _e:
     def expand_query(q: str) -> list[str]:
         return [q]
 
+# v0.8 bge-reranker 精排 · 容错导入(模型加载失败时降级到纯 RRF 结果)
+RERANKER_ENABLED = os.getenv("RERANKER_ENABLED", "true").lower() in ("1", "true", "yes")
+if RERANKER_ENABLED:
+    try:
+        from pipeline import reranker as _reranker_module
+        RERANKER_AVAILABLE = True
+    except Exception as _e:
+        print(f"[server] reranker 不可用: {_e}")
+        RERANKER_AVAILABLE = False
+else:
+    RERANKER_AVAILABLE = False
+
 load_dotenv()
 
 app = FastAPI(
@@ -215,21 +227,38 @@ def list_videos(limit: int = 200, offset: int = 0):
         conn.close()
 
 
+PATH_WEIGHTS = {"text": 1.5, "image": 1.0, "audio": 0.7, "anchor": 1.3}
+# 每路只取前 N 名进 fusion · 防止 distance 较大的"凑数命中"灌进总分
+PATH_MAX_RANK = {"text": 5, "image": 5, "audio": 3, "anchor": 5}
+
+
 def _rrf_fuse(*hit_lists_named: tuple[str, list[dict]], k: int = 60) -> list[dict]:
-    """N 路 RRF 融合 · 标签每路命中来源 + 每路真实 distance。"""
+    """Distance-aware 加权融合(替代纯 RRF)。
+
+    设计要点:
+      1. score = Σ w_path * 1/(1 + distance_path)  —— distance 越低得分越高
+      2. 每路只算前 N 名(PATH_MAX_RANK):
+         避免某条视频在 audio 路 dist=1.2(远距离凑数)被无脑奖励。
+      3. text 权重 1.5(信号最浓 — caption+transcript+frame_desc),
+         audio 权重 0.7(CLAP 对具体内容识别弱)。
+      4. 缺路自然是 0,不被惩罚 —— 图集帖没 audio 不再吃亏。
+    """
     scores: dict[str, float] = {}
     payload: dict[str, dict] = {}
     path_distances: dict[str, dict[str, float]] = {}
 
     for source_name, hits in hit_lists_named:
-        for rank, h in enumerate(hits):
+        w = PATH_WEIGHTS.get(source_name, 1.0)
+        max_rank = PATH_MAX_RANK.get(source_name, 5)
+        for h in hits[:max_rank]:
             vid = h["id"]
-            scores[vid] = scores.get(vid, 0.0) + 1.0 / (k + rank)
+            dist = float(h.get("distance", 1.0))
+            scores[vid] = scores.get(vid, 0.0) + w / (1.0 + dist)
             d = payload.setdefault(vid, h)
             d.setdefault("_source", set()).add(source_name)
-            path_distances.setdefault(vid, {})[source_name] = float(h.get("distance", 0))
-            if h.get("distance", 1e9) < d.get("distance", 1e9):
-                d["distance"] = h["distance"]
+            path_distances.setdefault(vid, {})[source_name] = dist
+            if dist < d.get("distance", 1e9):
+                d["distance"] = dist
 
     sorted_ids = sorted(scores.keys(), key=lambda v: -scores[v])
     out: list[dict] = []
@@ -256,11 +285,12 @@ def search(req: SearchRequest):
             print(f"  [/search] expand 失败,只用原 query: {e}")
             expanded = [q_text]
 
-    # ============ 1. 每个改写查询都跑三路检索 ============
+    # ============ 1. 每个改写查询都跑四路检索 ============
     # 同一路里多个 query 的命中合并,取每条视频的最小 distance
     merged_text: dict[str, dict] = {}
     merged_image: dict[str, dict] = {}
     merged_audio: dict[str, dict] = {}
+    merged_anchor: dict[str, dict] = {}
 
     for q in expanded:
         try:
@@ -299,6 +329,12 @@ def search(req: SearchRequest):
                     vid = h["id"]
                     if vid not in merged_audio or h["distance"] < merged_audio[vid]["distance"]:
                         merged_audio[vid] = h
+            # v0.7: anchor 路 · 用 q_text_vec(智谱 2048d,跟 vec_anchors 同空间)
+            if store.count_anchors(conn) > 0:
+                for h in store.search_anchor(conn, q_text_vec, top_k=req.top_k * 2):
+                    vid = h["id"]
+                    if vid not in merged_anchor or h["distance"] < merged_anchor[vid]["distance"]:
+                        merged_anchor[vid] = h
         finally:
             conn.close()
 
@@ -306,14 +342,32 @@ def search(req: SearchRequest):
     text_hits = sorted(merged_text.values(), key=lambda x: x["distance"])
     image_hits = sorted(merged_image.values(), key=lambda x: x["distance"])
     audio_hits = sorted(merged_audio.values(), key=lambda x: x["distance"])
+    anchor_hits = sorted(merged_anchor.values(), key=lambda x: x["distance"])
 
-    # ============ 2. RRF 三路融合 ============
+    # ============ 2. RRF 多路融合 ============
     fuse_inputs: list[tuple[str, list[dict]]] = [("text", text_hits)]
     if image_hits:
         fuse_inputs.append(("image", image_hits))
     if audio_hits:
         fuse_inputs.append(("audio", audio_hits))
-    raw_hits = _rrf_fuse(*fuse_inputs)[:req.top_k] if len(fuse_inputs) > 1 else text_hits[:req.top_k]
+    if anchor_hits:
+        fuse_inputs.append(("anchor", anchor_hits))
+
+    # RRF 输出 top_k*3 进 reranker(给精排留挑选空间) → reranker 取 top_k
+    rrf_candidates = _rrf_fuse(*fuse_inputs) if len(fuse_inputs) > 1 else text_hits
+    rerank_pool_size = req.top_k * 3
+    rrf_candidates = rrf_candidates[:rerank_pool_size]
+
+    # v0.8: cross-encoder 精排(bge-reranker-v2-m3)
+    # RRF 看的是 distance,reranker 看的是 (query, doc) 真实相关性 — 更准
+    if RERANKER_AVAILABLE and len(rrf_candidates) > 1:
+        try:
+            raw_hits = _reranker_module.rerank(q_text, rrf_candidates, top_k=req.top_k)
+        except Exception as e:
+            print(f"  [/search] reranker 失败,降级 RRF: {e}")
+            raw_hits = rrf_candidates[:req.top_k]
+    else:
+        raw_hits = rrf_candidates[:req.top_k]
 
     explanations: dict[str, str] = {}
     if req.rerank and raw_hits:
