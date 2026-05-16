@@ -445,6 +445,40 @@ def _llm_explain(query: str, hits: list[dict]) -> dict[str, str]:
         return {}
 
 
+@app.get("/starfield")
+def starfield():
+    """返回全部星(降维坐标 + 星系 + 标题)。star_coords 不存在时返回空,
+    前端提示先跑 pipeline.starfield。"""
+    conn = get_conn()
+    try:
+        try:
+            rows = conn.execute(
+                """
+                SELECT s.video_id, s.x, s.y, s.z, s.galaxy_id,
+                       v.title, v.url
+                FROM star_coords s JOIN videos v ON v.id = s.video_id
+                """
+            ).fetchall()
+        except Exception:
+            return {"total": 0, "stars": [], "galaxies": {}, "ready": False}
+    finally:
+        conn.close()
+
+    stars = [
+        {"id": r[0], "x": r[1], "y": r[2], "z": r[3],
+         "g": r[4], "title": r[5] or r[0], "url": r[6]}
+        for r in rows
+    ]
+    from collections import Counter
+    gc = Counter(s["g"] for s in stars)
+    return {
+        "total": len(stars),
+        "stars": stars,
+        "galaxies": {str(k): v for k, v in sorted(gc.items())},
+        "ready": len(stars) > 0,
+    }
+
+
 # ============ Static frontend ============
 _WEB_DIR = Path(__file__).parent.parent / "web"
 if _WEB_DIR.exists():

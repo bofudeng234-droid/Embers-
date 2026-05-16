@@ -30,7 +30,7 @@ MAIN_PROFILE = Path.home() / ".embers_pw_profile"
 STATE_FILE = Path.home() / ".embers_daemon_state.json"
 LOG_FILE = Path.home() / ".embers_daemon.log"
 
-MIN_INTERVAL_HOURS = float(os.getenv("EMBERS_DAEMON_MIN_HOURS", "11"))
+MIN_INTERVAL_HOURS = float(os.getenv("EMBERS_DAEMON_MIN_HOURS", "8"))
 WORKERS = int(os.getenv("EMBERS_DAEMON_WORKERS", "4"))
 CRAWL_TARGET = int(os.getenv("EMBERS_DAEMON_CRAWL_N", "1000"))
 
